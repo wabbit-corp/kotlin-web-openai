@@ -30,6 +30,7 @@ import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.flow.toList
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
@@ -501,6 +502,8 @@ class OpenAIApiSpec {
         assertTrue(OpenAIProvider.Azure(resourceName = "demo").capabilities.chatCompletions)
         assertTrue(OpenAIProvider.Azure(resourceName = "demo").capabilities.embeddingsApi)
         assertTrue(OpenAIProvider.Azure(resourceName = "demo").capabilities.modelsApi)
+        assertTrue(OpenAIProvider.Azure(resourceName = "demo").capabilities.imagesApi)
+        assertTrue(OpenAIProvider.Azure(resourceName = "demo").capabilities.audioApi)
         assertTrue(OpenAIProvider.Groq.capabilities.responsesApi)
         assertTrue(!OpenAIProvider.Groq.capabilities.statefulResponses)
         assertTrue(OpenAIProvider.Groq.capabilities.chatCompletions)
@@ -724,6 +727,22 @@ class OpenAIApiSpec {
     }
 
     @Test
+    fun `responses named function tool choice serializes flat function object`() {
+        val request =
+            ResponseCreateRequest(
+                model = ModelId("gpt-5"),
+                input = ResponseInput.Text("call get_weather"),
+                toolChoice = ResponseToolChoice.NamedFunction("get_weather"),
+            )
+
+        val toolChoice = request.toJson()["tool_choice"]!!.jsonObject
+
+        assertEquals("function", toolChoice["type"]?.jsonPrimitive?.content)
+        assertEquals("get_weather", toolChoice["name"]?.jsonPrimitive?.content)
+        assertTrue(toolChoice["function"] == null)
+    }
+
+    @Test
     fun `responses request serializes richer typed fields and preview tool variants`() {
         val request =
             ResponseCreateRequest(
@@ -765,19 +784,35 @@ class OpenAIApiSpec {
                             toolType = ResponseTool.ComputerUseType.COMPUTER_USE_PREVIEW,
                             displayNumber = 1,
                         ),
-                    ),
+                ),
             )
 
-        val json = request.toJson().toString()
-        assertTrue(json.contains("\"type\":\"input_audio\""))
-        assertTrue(json.contains("\"background\":true"))
-        assertTrue(json.contains("\"conversation\":{\"id\":\"conv_1\"}"))
-        assertTrue(json.contains("\"max_tool_calls\":4"))
-        assertTrue(json.contains("\"prompt\":{\"id\":\"pmpt_1\""))
-        assertTrue(json.contains("\"service_tier\":\"flex\""))
-        assertTrue(json.contains("\"truncation\":\"auto\""))
-        assertTrue(json.contains("\"type\":\"web_search_preview\""))
-        assertTrue(json.contains("\"display_number\":1"))
+        val json = request.toJson()
+        val messageContent =
+            json["input"]!!
+                .jsonArray
+                .single()
+                .jsonObject["content"]!!
+                .jsonArray
+        val inputAudio =
+            messageContent
+                .single { it.jsonObject["type"]?.jsonPrimitive?.content == "input_audio" }
+                .jsonObject
+
+        assertEquals("input_audio", inputAudio["type"]?.jsonPrimitive?.content)
+        assertEquals("UklGRg==", inputAudio["input_audio"]?.jsonObject?.get("data")?.jsonPrimitive?.content)
+        assertEquals("wav", inputAudio["input_audio"]?.jsonObject?.get("format")?.jsonPrimitive?.content)
+        assertTrue(inputAudio["data"] == null)
+        assertTrue(inputAudio["format"] == null)
+        val jsonString = json.toString()
+        assertTrue(jsonString.contains("\"background\":true"))
+        assertTrue(jsonString.contains("\"conversation\":{\"id\":\"conv_1\"}"))
+        assertTrue(jsonString.contains("\"max_tool_calls\":4"))
+        assertTrue(jsonString.contains("\"prompt\":{\"id\":\"pmpt_1\""))
+        assertTrue(jsonString.contains("\"service_tier\":\"flex\""))
+        assertTrue(jsonString.contains("\"truncation\":\"auto\""))
+        assertTrue(jsonString.contains("\"type\":\"web_search_preview\""))
+        assertTrue(jsonString.contains("\"display_number\":1"))
     }
 
     @Test
@@ -830,6 +865,52 @@ class OpenAIApiSpec {
         val json = tool.toJson().toString()
         assertTrue(json.contains("\"type\":\"mcp\""))
         assertTrue(json.contains("\"require_approval\":{\"never\":{\"tool_names\":[\"search\",\"fetch\"]}}"))
+    }
+
+    @Test
+    fun `mcp tool serializes allowed tool filters and approval read_only filters`() {
+        val tool =
+            ResponseTool.Mcp(
+                serverLabel = "docs",
+                serverUrl = "https://mcp.example.com",
+                allowedToolFilter =
+                    ResponseTool.McpAllowedTools.Filter(
+                        readOnly = true,
+                        toolNames = listOf("search", "fetch"),
+                    ),
+                requireApproval =
+                    ResponseTool.McpRequireApproval.Filter(
+                        policy = ResponseTool.McpRequireApproval.Policy.ALWAYS,
+                        readOnly = false,
+                        toolNames = listOf("write"),
+                    ),
+            )
+
+        val json = tool.toJson().toString()
+        assertTrue(json.contains("\"allowed_tools\":{\"read_only\":true,\"tool_names\":[\"search\",\"fetch\"]}"))
+        assertTrue(json.contains("\"require_approval\":{\"always\":{\"read_only\":false,\"tool_names\":[\"write\"]}}"))
+    }
+
+    @Test
+    fun `responses input messages encode assistant phase and supported roles`() {
+        val message =
+            ResponseInputItem.Message(
+                role = ResponseRole.ASSISTANT,
+                phase = ResponseMessagePhase.COMMENTARY,
+                content = listOf(ResponseInputContent.InputText("thinking")),
+            )
+
+        val json = message.toJson().toString()
+        assertTrue(json.contains("\"role\":\"assistant\""))
+        assertTrue(json.contains("\"phase\":\"commentary\""))
+        assertEquals(listOf("SYSTEM", "DEVELOPER", "USER", "ASSISTANT"), ResponseRole.entries.map { it.name })
+        assertFailsWith<IllegalArgumentException> {
+            ResponseInputItem.Message(
+                role = ResponseRole.USER,
+                phase = ResponseMessagePhase.FINAL_ANSWER,
+                content = listOf(ResponseInputContent.InputText("hello")),
+            )
+        }
     }
 
     @Test
@@ -918,6 +999,7 @@ class OpenAIApiSpec {
         assertEquals("https://mcp.example.com", call.serverUrl)
         assertEquals("mcp_1", response.output.single().toInputReferenceOrNull()?.id)
         assertEquals("web_search_call.action.sources", ResponseInclude.WEB_SEARCH_CALL_ACTION_SOURCES.wireName)
+        assertEquals("web_search_call.results", ResponseInclude.WEB_SEARCH_CALL_RESULTS.wireName)
     }
 
     @Test
@@ -1936,6 +2018,65 @@ class OpenAIApiSpec {
         assertEquals(2, response.choices.single().logprobs?.content?.single()?.topLogprobs?.size)
         assertEquals(3, response.usage?.promptTokensDetails?.cachedTokens)
         assertEquals(2, response.usage?.completionTokensDetails?.reasoningTokens)
+    }
+
+    @Test
+    fun `chat completion function tools serialize nested function envelope`() = runTest {
+        var seenRequest: HttpRequestData? = null
+        val client = httpClient { request ->
+            seenRequest = request
+            respondJson("""{"id":"chatcmpl_tools","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}""")
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        api.createChatCompletion(
+            ChatCompletionRequest(
+                model = ModelId("gpt-4.1-mini"),
+                messages = listOf(ChatMessage(role = ChatRole.USER, content = ChatMessageContent.Text("ping"))),
+                tools =
+                    listOf(
+                        ResponseTool.Function(
+                            name = "get_weather",
+                            description = "Look up the weather",
+                            parameters = buildJsonObject { put("type", "object") },
+                            strict = true,
+                        ),
+                    ),
+                toolChoice = ResponseToolChoice.NamedFunction("get_weather"),
+            ),
+        )
+
+        val payload = OpenAIJson.parseToJsonElement(assertNotNull(seenRequest).bodyText()).jsonObject
+        val tool = payload["tools"]!!.jsonArray.single().jsonObject
+        val toolChoice = payload["tool_choice"]!!.jsonObject
+
+        assertEquals("function", tool["type"]?.jsonPrimitive?.content)
+        assertEquals("get_weather", tool["function"]?.jsonObject?.get("name")?.jsonPrimitive?.content)
+        assertEquals("Look up the weather", tool["function"]?.jsonObject?.get("description")?.jsonPrimitive?.content)
+        assertEquals("object", tool["function"]?.jsonObject?.get("parameters")?.jsonObject?.get("type")?.jsonPrimitive?.content)
+        assertEquals("true", tool["function"]?.jsonObject?.get("strict")?.jsonPrimitive?.toString())
+        assertTrue(tool["name"] == null)
+        assertTrue(tool["description"] == null)
+        assertTrue(tool["parameters"] == null)
+        assertTrue(tool["strict"] == null)
+
+        assertEquals("function", toolChoice["type"]?.jsonPrimitive?.content)
+        assertEquals("get_weather", toolChoice["function"]?.jsonObject?.get("name")?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `chat completions reject responses only hosted tools`() {
+        val error =
+            assertFailsWith<IllegalArgumentException> {
+                ChatCompletionRequest(
+                    model = ModelId("gpt-4.1-mini"),
+                    messages = listOf(ChatMessage(role = ChatRole.USER, content = ChatMessageContent.Text("ping"))),
+                    tools = listOf(ResponseTool.ImageGeneration()),
+                    toolChoice = ResponseToolChoice.Hosted("image_generation"),
+                )
+            }
+
+        assertTrue(error.message.orEmpty().contains("chat completions"))
     }
 
     @Test
@@ -3271,6 +3412,126 @@ class OpenAIApiSpec {
     }
 
     @Test
+    fun `createTranscription sends typed diarization multipart fields`() = runTest {
+        var seenRequest: HttpRequestData? = null
+        val client = httpClient { request ->
+            seenRequest = request
+            assertEquals(HttpMethod.Post, request.method)
+            assertEquals("/v1/audio/transcriptions", request.url.encodedPath)
+            respondJson(
+                """
+                {
+                  "text":"hello there",
+                  "task":"transcribe",
+                  "duration":1.2,
+                  "response_format":"diarized_json",
+                  "segments":[
+                    {
+                      "id":"seg_001",
+                      "type":"transcript.text.segment",
+                      "start":0.0,
+                      "end":1.2,
+                      "speaker":"A",
+                      "text":"hello there"
+                    }
+                  ]
+                }
+                """.trimIndent(),
+            )
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        val result =
+            api.createTranscription(
+                TranscriptionRequest(
+                    file = BinaryUpload("clip.wav", "WAVE".encodeToByteArray(), "audio/wav"),
+                    model = ModelId("gpt-4o-transcribe-diarize"),
+                    responseFormat = AudioTextResponseFormat.DIARIZED_JSON,
+                    chunkingStrategy =
+                        AudioChunkingStrategy.ServerVad(
+                            threshold = 0.4,
+                            prefixPaddingMs = 250,
+                            silenceDurationMs = 450,
+                        ),
+                    knownSpeakerNames = listOf("agent", "customer"),
+                    knownSpeakerReferences =
+                        listOf(
+                            "data:audio/wav;base64,QUdFTlQ=",
+                            "data:audio/wav;base64,Q1VTVE9NRVI=",
+                        ),
+                    stream = false,
+                ),
+            )
+
+        assertEquals("hello there", result.text)
+        assertEquals("seg_001", result.diarizedSegments.single().id)
+        val body = assertNotNull(seenRequest).bodyText()
+        assertTrue(body.contains("known_speaker_names[]"))
+        assertTrue(body.contains("known_speaker_references[]"))
+        assertTrue(body.contains("chunking_strategy[type]"))
+        assertTrue(body.contains("chunking_strategy[threshold]"))
+        assertTrue(body.contains("stream"))
+        assertTrue(body.contains("diarized_json"))
+    }
+
+    @Test
+    fun `transcription recognizes diarized response format`() {
+        val result =
+            OpenAIJson.decodeFromString<TranscriptionResult>(
+                """
+                {
+                  "text":"hello there",
+                  "response_format":"diarized_json",
+                  "segments":[
+                    {
+                      "id":"seg_001",
+                      "type":"transcript.text.segment",
+                      "start":0.0,
+                      "end":1.2,
+                      "text":"hello there",
+                      "speaker":"A"
+                    }
+                  ],
+                  "logprobs":[
+                    {"token":"hello","bytes":[104,101,108,108,111],"logprob":-0.1}
+                  ]
+                }
+                """.trimIndent(),
+            )
+
+        assertTrue(result.responseFormat !is AudioTextResponseFormatValue.Unknown)
+    }
+
+    @Test
+    fun `transcription decodes diarized segments with string ids`() {
+        val result =
+            OpenAIJson.decodeFromString<TranscriptionResult>(
+                """
+                {
+                  "text":"hello there",
+                  "task":"transcribe",
+                  "duration":1.2,
+                  "response_format":"diarized_json",
+                  "segments":[
+                    {
+                      "id":"seg_001",
+                      "type":"transcript.text.segment",
+                      "start":0.0,
+                      "end":1.2,
+                      "speaker":"agent",
+                      "text":"hello there"
+                    }
+                  ]
+                }
+                """.trimIndent(),
+            )
+
+        assertEquals("seg_001", result.diarizedSegments.single().id)
+        assertEquals("agent", result.diarizedSegments.single().speaker)
+        assertTrue(result.segments.isEmpty())
+    }
+
+    @Test
     fun `uploadFile sends multipart file upload`() = runTest {
         var seenRequest: HttpRequestData? = null
         val client = httpClient { request ->
@@ -3398,6 +3659,16 @@ class OpenAIApiSpec {
         assertEquals(EvalRunOutputItemStatus.Unknown("borderline"), evalRunOutputItem.status)
         assertEquals(ChatCompletionFinishReason.Unknown("unexpected"), chunk.choices.single().finishReason)
         assertEquals(ChatCompletionToolCallType.Unknown("vendor_function"), chunk.choices.single().delta?.toolCalls?.single()?.type)
+    }
+
+    @Test
+    fun `response status recognizes queued`() {
+        val response =
+            OpenAIJson.decodeFromString<ResponseObject>(
+                """{"id":"resp_q","object":"response","status":"queued","output":[]}""",
+            )
+
+        assertTrue(response.status !is ResponseStatus.Unknown)
     }
 
     @Test
@@ -4124,9 +4395,46 @@ class OpenAIApiSpec {
             seenBodies += request.bodyText()
             when (request.url.encodedPath) {
                 "/v1/realtime/sessions" ->
-                    respondJson("""{"id":"sess_1","object":"realtime.session","type":"realtime","model":"gpt-4o-realtime-preview","output_modalities":["text","audio"],"include":["item.input_audio_transcription.logprobs"],"client_secret":{"value":"secret","expires_at":1711475000}}""")
+                    respondJson(
+                        """
+                        {
+                          "id":"sess_1",
+                          "object":"realtime.session",
+                          "model":"gpt-realtime-2025-08-25",
+                          "modalities":["audio","text"],
+                          "instructions":"You are a friendly assistant.",
+                          "voice":"alloy",
+                          "input_audio_format":"pcm16",
+                          "output_audio_format":"pcm16",
+                          "input_audio_transcription":{"model":"whisper-1"},
+                          "turn_detection":null,
+                          "tools":[],
+                          "tool_choice":"none",
+                          "temperature":0.7,
+                          "max_response_output_tokens":200,
+                          "speed":1.1,
+                          "include":["item.input_audio_transcription.logprobs"],
+                          "client_secret":{"value":"secret","expires_at":1711475000}
+                        }
+                        """.trimIndent(),
+                    )
                 "/v1/realtime/transcription_sessions" ->
-                    respondJson("""{"id":"sess_2","object":"realtime.session","type":"transcription","output_modalities":["audio"],"model":"gpt-4o-mini-transcribe","include":["item.input_audio_transcription.confidence"],"client_secret":{"value":"secret2","expires_at":1711475001}}""")
+                    respondJson(
+                        """
+                        {
+                          "id":"sess_2",
+                          "object":"realtime.session",
+                          "type":"transcription",
+                          "model":"gpt-4o-transcribe-diarize",
+                          "modalities":["audio"],
+                          "input_audio_format":"pcm16",
+                          "input_audio_transcription":{"model":"gpt-4o-transcribe-diarize"},
+                          "turn_detection":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500},
+                          "include":["item.input_audio_transcription.confidence"],
+                          "client_secret":{"value":"secret2","expires_at":1711475001}
+                        }
+                        """.trimIndent(),
+                    )
                 else -> error("unexpected path ${request.url.encodedPath}")
             }
         }
@@ -4137,38 +4445,189 @@ class OpenAIApiSpec {
                 RealtimeSessionCreateRequest(
                     model = ModelId("gpt-4o-realtime-preview"),
                     outputModalities = listOf(RealtimeModality.TEXT, RealtimeModality.AUDIO),
+                    instructions = "You are a friendly assistant.",
                     audio =
                         RealtimeAudioConfig(
-                            output = RealtimeAudioOutputConfig(voice = "alloy"),
+                            input =
+                                RealtimeAudioInputConfig(
+                                    format = RealtimeAudioFormatConfig.PCM_24K,
+                                    transcription = RealtimeInputTranscriptionConfig(model = ModelId("whisper-1")),
+                                ),
+                            output =
+                                RealtimeAudioOutputConfig(
+                                    format = RealtimeAudioFormatConfig.PCM_24K,
+                                    voice = "alloy",
+                                    speed = 1.1,
+                                ),
                         ),
+                    toolChoice = ResponseToolChoice.None,
+                    temperature = 0.7,
+                    maxResponseOutputTokens = kotlinx.serialization.json.JsonPrimitive(200),
+                    include = listOf(RealtimeInclude.INPUT_AUDIO_TRANSCRIPTION_LOGPROBS),
                 ),
             )
         val transcription =
             api.createRealtimeTranscriptionSession(
                 RealtimeTranscriptionSessionCreateRequest(
-                    model = ModelId("gpt-4o-mini-transcribe"),
+                    model = ModelId("gpt-4o-transcribe-diarize"),
                     audio =
                         RealtimeAudioConfig(
-                            input = RealtimeAudioInputConfig(format = RealtimeAudioFormatConfig.PCM_24K),
+                            input =
+                                RealtimeAudioInputConfig(
+                                    format = RealtimeAudioFormatConfig.PCM_24K,
+                                    transcription = RealtimeInputTranscriptionConfig(model = ModelId("gpt-4o-transcribe-diarize")),
+                                    turnDetection =
+                                        RealtimeTurnDetection.ServerVad(
+                                            threshold = 0.5,
+                                            prefixPaddingMs = 300,
+                                            silenceDurationMs = 500,
+                                        ),
+                                ),
                         ),
                 ),
             )
 
         assertEquals("sess_1", session.id)
-        assertEquals(RealtimeSessionTypeValue.Realtime, session.type)
-        assertEquals(listOf(RealtimeModalityValue.Text, RealtimeModalityValue.Audio), session.outputModalities)
+        assertEquals(listOf(RealtimeModalityValue.Audio, RealtimeModalityValue.Text), session.outputModalities)
         assertEquals(RealtimeIncludeValue.ItemInputAudioTranscriptionLogprobs, session.include?.single())
         assertEquals("secret", session.clientSecret?.value)
         assertEquals("sess_2", transcription.id)
         assertEquals(RealtimeSessionTypeValue.Transcription, transcription.type)
         assertEquals(listOf(RealtimeModalityValue.Audio), transcription.outputModalities)
         assertEquals(RealtimeIncludeValue.ItemInputAudioTranscriptionConfidence, transcription.include?.single())
-        assertTrue(seenBodies[0].contains("\"type\":\"realtime\""))
-        assertTrue(seenBodies[0].contains("\"output_modalities\":[\"text\",\"audio\"]"))
-        assertTrue(seenBodies[0].contains("\"audio\":{\"output\":{\"voice\":\"alloy\"}}"))
-        assertTrue(seenBodies[1].contains("\"type\":\"transcription\""))
-        assertTrue(seenBodies[1].contains("\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000}}}"))
+        assertTrue(seenBodies[0].contains("\"modalities\":[\"text\",\"audio\"]"))
+        assertTrue(seenBodies[0].contains("\"voice\":\"alloy\""))
+        assertTrue(seenBodies[0].contains("\"input_audio_format\":\"pcm16\""))
+        assertTrue(seenBodies[0].contains("\"output_audio_format\":\"pcm16\""))
+        assertTrue(seenBodies[0].contains("\"input_audio_transcription\":{\"model\":\"whisper-1\"}"))
+        assertTrue(seenBodies[0].contains("\"tool_choice\":\"none\""))
+        assertTrue(seenBodies[0].contains("\"speed\":1.1"))
+        assertTrue(seenBodies[1].contains("\"input_audio_format\":\"pcm16\""))
+        assertTrue(seenBodies[1].contains("\"input_audio_transcription\":{\"model\":\"gpt-4o-transcribe-diarize\"}"))
+        assertTrue(seenBodies[1].contains("\"turn_detection\":{\"type\":\"server_vad\",\"threshold\":0.5,\"prefix_padding_ms\":300,\"silence_duration_ms\":500}"))
         assertEquals(listOf("/v1/realtime/sessions", "/v1/realtime/transcription_sessions"), seenPaths)
+    }
+
+    @Test
+    fun `realtime client secret endpoint wraps nested session config and decodes effective session`() = runTest {
+        var seenRequest: HttpRequestData? = null
+        val client = httpClient { request ->
+            seenRequest = request
+            assertEquals(HttpMethod.Post, request.method)
+            assertEquals("/v1/realtime/client_secrets", request.url.encodedPath)
+            respondJson(
+                """
+                {
+                  "value":"ek_123",
+                  "expires_at":1756310470,
+                  "session":{
+                    "type":"realtime",
+                    "object":"realtime.session",
+                    "id":"sess_secret_1",
+                    "model":"gpt-realtime",
+                    "output_modalities":["audio"],
+                    "instructions":"You are a friendly assistant.",
+                    "tools":[],
+                    "tool_choice":"auto",
+                    "max_output_tokens":"inf",
+                    "tracing":null,
+                    "prompt":null,
+                    "expires_at":0,
+                    "audio":{
+                      "input":{
+                        "format":{"type":"audio/pcm","rate":24000},
+                        "transcription":null,
+                        "noise_reduction":null,
+                        "turn_detection":{"type":"server_vad"}
+                      },
+                      "output":{
+                        "format":{"type":"audio/pcm","rate":24000},
+                        "voice":"alloy",
+                        "speed":1.0
+                      }
+                    },
+                    "include":null
+                  }
+                }
+                """.trimIndent(),
+            )
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        val secret =
+            api.createRealtimeClientSecret(
+                session =
+                    RealtimeSessionCreateRequest(
+                        model = ModelId("gpt-realtime"),
+                        outputModalities = listOf(RealtimeModality.AUDIO),
+                        instructions = "You are a friendly assistant.",
+                        audio =
+                            RealtimeAudioConfig(
+                                input = RealtimeAudioInputConfig(format = RealtimeAudioFormatConfig.PCM_24K),
+                                output =
+                                    RealtimeAudioOutputConfig(
+                                        format = RealtimeAudioFormatConfig.PCM_24K,
+                                        voice = "alloy",
+                                    ),
+                            ),
+                        maxResponseOutputTokens = kotlinx.serialization.json.JsonPrimitive(400),
+                    ),
+                expiresAfter = RealtimeClientSecretExpiration(seconds = 600),
+            )
+
+        assertEquals("ek_123", secret.value)
+        assertEquals("sess_secret_1", secret.session.id)
+        assertEquals("inf", secret.session.maxOutputTokens?.jsonPrimitive?.content)
+        val body = assertNotNull(seenRequest).bodyText()
+        assertTrue(body.contains("\"expires_after\":{\"anchor\":\"created_at\",\"seconds\":600}"))
+        assertTrue(body.contains("\"session\":{\"type\":\"realtime\""))
+        assertTrue(body.contains("\"output_modalities\":[\"audio\"]"))
+        assertTrue(body.contains("\"max_output_tokens\":400"))
+        assertTrue(body.contains("\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000}}"))
+    }
+
+    @Test
+    fun `deprecated realtime transcription sessions use input audio noise reduction field name`() = runTest {
+        var seenRequest: HttpRequestData? = null
+        val client = httpClient { request ->
+            seenRequest = request
+            assertEquals(HttpMethod.Post, request.method)
+            assertEquals("/v1/realtime/transcription_sessions", request.url.encodedPath)
+            respondJson(
+                """
+                {
+                  "id":"sess_tx_1",
+                  "object":"realtime.transcription_session",
+                  "type":"transcription",
+                  "modalities":["audio","text"],
+                  "input_audio_format":"pcm16",
+                  "input_audio_transcription":{"model":"gpt-4o-transcribe"},
+                  "turn_detection":{"type":"server_vad","threshold":0.5},
+                  "client_secret":null
+                }
+                """.trimIndent(),
+            )
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        api.createRealtimeTranscriptionSession(
+            RealtimeTranscriptionSessionCreateRequest(
+                model = ModelId("gpt-4o-transcribe"),
+                audio =
+                    RealtimeAudioConfig(
+                        input =
+                            RealtimeAudioInputConfig(
+                                format = RealtimeAudioFormatConfig.PCM_24K,
+                                noiseReduction = RealtimeNoiseReduction.Enabled(RealtimeNoiseReductionType.NEAR_FIELD),
+                                transcription = RealtimeInputTranscriptionConfig(model = ModelId("gpt-4o-transcribe")),
+                            ),
+                    ),
+            ),
+        )
+
+        val body = assertNotNull(seenRequest).bodyText()
+        assertTrue(body.contains("\"input_audio_noise_reduction\":{\"type\":\"near_field\"}"))
+        assertTrue(!body.contains("\"noise_reduction\""))
     }
 
     @Test
@@ -4474,6 +4933,15 @@ class OpenAIApiSpec {
 
         assertEquals("evt_1", event.id)
         assertEquals("response.completed", event.type)
+    }
+
+    @Test
+    fun `speech audio chunks compare by content`() {
+        val left = SpeechStreamEvent.AudioChunk("hello".encodeToByteArray())
+        val right = SpeechStreamEvent.AudioChunk("hello".encodeToByteArray())
+
+        assertEquals(left, right)
+        assertEquals(left.hashCode(), right.hashCode())
     }
 }
 

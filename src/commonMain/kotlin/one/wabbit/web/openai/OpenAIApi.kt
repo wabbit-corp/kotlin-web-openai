@@ -164,6 +164,14 @@ interface OpenAIApi {
     suspend fun deleteConversationItem(conversationId: ConversationId, itemId: ConversationItemId): DeletedObject
     suspend fun createRealtimeSession(request: RealtimeSessionCreateRequest): RealtimeSessionObject
     suspend fun createRealtimeTranscriptionSession(request: RealtimeTranscriptionSessionCreateRequest): RealtimeSessionObject
+    suspend fun createRealtimeClientSecret(
+        session: RealtimeSessionCreateRequest,
+        expiresAfter: RealtimeClientSecretExpiration? = null,
+    ): RealtimeClientSecretResponse
+    suspend fun createRealtimeClientSecret(
+        session: RealtimeTranscriptionSessionCreateRequest,
+        expiresAfter: RealtimeClientSecretExpiration? = null,
+    ): RealtimeClientSecretResponse
     suspend fun createEval(request: EvalCreateRequest): EvalObject
     suspend fun getEval(evalId: EvalId): EvalObject
     suspend fun listEvals(query: EvalListQuery = EvalListQuery()): EvalPage
@@ -932,14 +940,21 @@ class KtorOpenAIApi(
     override suspend fun createTranscription(request: TranscriptionRequest): TranscriptionResult =
         withNonIdempotentRetry {
             provider.requireAudioApiSupport()
+            require(request.stream != true) {
+                "Streaming audio transcriptions are not implemented in this client yet"
+            }
             val url = transcriptionUrl()
             val response =
                 postMultipart(url, accept = "*/*") {
                     appendBinaryUpload("file", request.file)
                     append("model", request.model.value)
+                    request.chunkingStrategy?.let { appendChunkingStrategy(it) }
+                    request.knownSpeakerNames.forEach { append("known_speaker_names[]", it) }
+                    request.knownSpeakerReferences.forEach { append("known_speaker_references[]", it) }
                     request.language?.let { append("language", it) }
                     request.prompt?.let { append("prompt", it) }
                     request.responseFormat?.let { append("response_format", it.wireName) }
+                    request.stream?.let { append("stream", it.toString()) }
                     request.temperature?.let { append("temperature", it.toString()) }
                     request.include.forEach { append("include[]", it.wireName) }
                     request.timestampGranularities.forEach { append("timestamp_granularities[]", it.wireName) }
@@ -1388,6 +1403,16 @@ class KtorOpenAIApi(
             decodeJsonBody(url, body)
         }
 
+    override suspend fun createRealtimeClientSecret(
+        session: RealtimeSessionCreateRequest,
+        expiresAfter: RealtimeClientSecretExpiration?,
+    ): RealtimeClientSecretResponse = createRealtimeClientSecretInternal(session.toClientSecretSessionJson(), expiresAfter)
+
+    override suspend fun createRealtimeClientSecret(
+        session: RealtimeTranscriptionSessionCreateRequest,
+        expiresAfter: RealtimeClientSecretExpiration?,
+    ): RealtimeClientSecretResponse = createRealtimeClientSecretInternal(session.toClientSecretSessionJson(), expiresAfter)
+
     override suspend fun createEval(request: EvalCreateRequest): EvalObject =
         withNonIdempotentRetry {
             provider.requireEvalsApiSupport()
@@ -1805,6 +1830,7 @@ class KtorOpenAIApi(
     private fun uploadsUrl(): String = apiBaseUrl() + "/uploads"
     private fun vectorStoresUrl(): String = apiBaseUrl() + "/vector_stores"
     private fun conversationsUrl(): String = apiBaseUrl() + "/conversations"
+    private fun realtimeClientSecretsUrl(): String = apiBaseUrl() + "/realtime/client_secrets"
     private fun realtimeSessionsUrl(): String = apiBaseUrl() + "/realtime/sessions"
     private fun realtimeTranscriptionSessionsUrl(): String = apiBaseUrl() + "/realtime/transcription_sessions"
     private fun evalsUrl(): String = apiBaseUrl() + "/evals"
@@ -1840,6 +1866,26 @@ class KtorOpenAIApi(
             ?.takeIf { it.isNotBlank() }
             ?.let { header("x-ms-oai-image-generation-deployment", it) }
     }
+
+    private suspend fun createRealtimeClientSecretInternal(
+        session: kotlinx.serialization.json.JsonObject,
+        expiresAfter: RealtimeClientSecretExpiration?,
+    ): RealtimeClientSecretResponse =
+        withNonIdempotentRetry {
+            provider.requireRealtimeBootstrapApiSupport()
+            val url = realtimeClientSecretsUrl()
+            val payload =
+                buildJsonObject {
+                    expiresAfter?.let { put("expires_after", it.toJson()) }
+                    put("session", session)
+                }
+            val response = postJson(url, payload, accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
 
     private suspend fun postJson(
         url: String,
@@ -1987,6 +2033,18 @@ class KtorOpenAIApi(
             OpenAIApiError.Api(url, status, parsed, retryAfterSeconds = retryAfterSeconds)
         } else {
             OpenAIApiError.Http(url, status, body.take(2048), retryAfterSeconds = retryAfterSeconds)
+        }
+    }
+
+    private fun FormBuilder.appendChunkingStrategy(strategy: AudioChunkingStrategy) {
+        when (strategy) {
+            AudioChunkingStrategy.Auto -> append("chunking_strategy", "auto")
+            is AudioChunkingStrategy.ServerVad -> {
+                append("chunking_strategy[type]", "server_vad")
+                strategy.threshold?.let { append("chunking_strategy[threshold]", it.toString()) }
+                strategy.prefixPaddingMs?.let { append("chunking_strategy[prefix_padding_ms]", it.toString()) }
+                strategy.silenceDurationMs?.let { append("chunking_strategy[silence_duration_ms]", it.toString()) }
+            }
         }
     }
 

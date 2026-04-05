@@ -3,6 +3,7 @@ package one.wabbit.web.openai
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.json.JsonNames
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -205,22 +206,33 @@ data class RealtimeSessionCreateRequest(
             "realtime session instructions must not be blank when set"
         }
         require(metadata.keys.all { it.isNotBlank() }) { "realtime session metadata keys must not be blank" }
+        require(tools.all { it is ResponseTool.Function || it is ResponseTool.Raw }) {
+            "realtime bootstrap only supports function tools in this client"
+        }
+        require(toolChoice !is ResponseToolChoice.Hosted) {
+            "realtime bootstrap does not support hosted tool choices in this client"
+        }
     }
 
     fun toJson(): JsonObject =
         buildJsonObject {
-            put("type", type.wireName)
             put("model", model.value)
             if (outputModalities.isNotEmpty()) {
-                putJsonArray("output_modalities") {
+                putJsonArray("modalities") {
                     outputModalities.forEach { add(JsonPrimitive(it.wireName)) }
                 }
             }
             instructions?.let { put("instructions", it) }
-            audio?.let { put("audio", it.toJson()) }
+            audio?.input?.format?.let { put("input_audio_format", it.toBootstrapWireName()) }
+            audio?.output?.format?.let { put("output_audio_format", it.toBootstrapWireName()) }
+            audio?.input?.transcription?.let { put("input_audio_transcription", it.toJson()) }
+            audio?.input?.turnDetection?.let { put("turn_detection", it.toJsonElement()) }
+            audio?.input?.noiseReduction?.let { put("noise_reduction", it.toJsonElement()) }
+            audio?.output?.voice?.let { put("voice", it) }
+            audio?.output?.speed?.let { put("speed", it) }
             if (tools.isNotEmpty()) {
                 putJsonArray("tools") {
-                    tools.forEach { add(it.toJson()) }
+                    tools.forEach { add(it.toRealtimeJson()) }
                 }
             }
             toolChoice?.let { put("tool_choice", it.toJson()) }
@@ -258,9 +270,11 @@ data class RealtimeTranscriptionSessionCreateRequest(
 
     fun toJson(): JsonObject =
         buildJsonObject {
-            put("type", type.wireName)
             put("model", model.value)
-            put("audio", audio.toJson())
+            audio.input?.format?.let { put("input_audio_format", it.toBootstrapWireName()) }
+            audio.input?.transcription?.let { put("input_audio_transcription", it.toJson()) }
+            audio.input?.turnDetection?.let { put("turn_detection", it.toJsonElement()) }
+            audio.input?.noiseReduction?.let { put("input_audio_noise_reduction", it.toJsonElement()) }
             if (include.isNotEmpty()) {
                 putJsonArray("include") {
                     include.forEach { add(JsonPrimitive(it.wireName)) }
@@ -273,10 +287,100 @@ data class RealtimeTranscriptionSessionCreateRequest(
         }
 }
 
+private fun RealtimeAudioFormatConfig.toBootstrapWireName(): String =
+    when (type) {
+        RealtimeAudioEncoding.AUDIO_PCM -> "pcm16"
+        RealtimeAudioEncoding.AUDIO_PCMU -> "g711_ulaw"
+        RealtimeAudioEncoding.AUDIO_PCMA -> "g711_alaw"
+    }
+
+private fun ResponseTool.toRealtimeJson(): JsonObject =
+    when (this) {
+        is ResponseTool.Function,
+        is ResponseTool.Raw,
+        -> toJson()
+        else -> error("realtime bootstrap only supports function tools in this client")
+    }
+
+internal fun RealtimeSessionCreateRequest.toClientSecretSessionJson(): JsonObject =
+    buildJsonObject {
+        put("type", type.wireName)
+        put("model", model.value)
+        if (outputModalities.isNotEmpty()) {
+            putJsonArray("output_modalities") {
+                outputModalities.forEach { add(JsonPrimitive(it.wireName)) }
+            }
+        }
+        instructions?.let { put("instructions", it) }
+        audio?.let { put("audio", it.toJson()) }
+        if (tools.isNotEmpty()) {
+            putJsonArray("tools") {
+                tools.forEach { add(it.toRealtimeJson()) }
+            }
+        }
+        toolChoice?.let { put("tool_choice", it.toJson()) }
+        temperature?.let { put("temperature", it) }
+        maxResponseOutputTokens?.let { put("max_output_tokens", it) }
+        if (include.isNotEmpty()) {
+            putJsonArray("include") {
+                include.forEach { add(JsonPrimitive(it.wireName)) }
+            }
+        }
+        if (metadata.isNotEmpty()) {
+            put("metadata", JsonObject(metadata.mapValues { JsonPrimitive(it.value) }))
+        }
+        prompt?.let { put("prompt", it) }
+        putJsonExtras(extraBody)
+    }
+
+internal fun RealtimeTranscriptionSessionCreateRequest.toClientSecretSessionJson(): JsonObject =
+    buildJsonObject {
+        put("type", type.wireName)
+        put("model", model.value)
+        put("audio", audio.toJson())
+        if (include.isNotEmpty()) {
+            putJsonArray("include") {
+                include.forEach { add(JsonPrimitive(it.wireName)) }
+            }
+        }
+        if (metadata.isNotEmpty()) {
+            put("metadata", JsonObject(metadata.mapValues { JsonPrimitive(it.value) }))
+        }
+        putJsonExtras(extraBody)
+    }
+
 @Serializable
 data class RealtimeClientSecret(
     val value: String? = null,
     @SerialName("expires_at") val expiresAt: Long? = null,
+)
+
+enum class RealtimeClientSecretExpirationAnchor(val wireName: String) {
+    CREATED_AT("created_at"),
+}
+
+data class RealtimeClientSecretExpiration(
+    val seconds: Int,
+    val anchor: RealtimeClientSecretExpirationAnchor = RealtimeClientSecretExpirationAnchor.CREATED_AT,
+) {
+    init {
+        require(seconds in 10..7200) {
+            "realtime client secret expiration seconds must be between 10 and 7200"
+        }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("anchor", anchor.wireName)
+            put("seconds", seconds)
+        }
+}
+
+@Serializable
+data class RealtimeClientSecretResponse(
+    val value: String,
+    @SerialName("expires_at") val expiresAt: Long,
+    val session: RealtimeSessionObject,
 )
 
 sealed interface RealtimeSessionTypeValue {
@@ -390,6 +494,7 @@ internal object RealtimeModalityValueListSerializer : kotlinx.serialization.KSer
 }
 
 @Serializable
+@OptIn(ExperimentalSerializationApi::class)
 data class RealtimeSessionObject(
     val id: String? = null,
     @SerialName("object") val objectType: String? = null,
@@ -397,20 +502,31 @@ data class RealtimeSessionObject(
     val type: RealtimeSessionTypeValue? = null,
     val model: String? = null,
     @SerialName("output_modalities")
+    @JsonNames("modalities")
     @Serializable(with = RealtimeModalityValueListSerializer::class)
     val outputModalities: List<RealtimeModalityValue>? = null,
     val instructions: String? = null,
     @SerialName("client_secret") val clientSecret: RealtimeClientSecret? = null,
     @SerialName("expires_at") val expiresAt: Long? = null,
     val metadata: JsonObject? = null,
+    val voice: String? = null,
+    @SerialName("input_audio_format") val inputAudioFormat: String? = null,
+    @SerialName("output_audio_format") val outputAudioFormat: String? = null,
+    @SerialName("input_audio_transcription") val inputAudioTranscription: JsonObject? = null,
+    @SerialName("turn_detection") val turnDetection: JsonElement? = null,
+    @SerialName("noise_reduction") val noiseReduction: JsonElement? = null,
     val audio: JsonObject? = null,
     val tools: JsonArray? = null,
     @SerialName("tool_choice") val toolChoice: JsonElement? = null,
     val temperature: Double? = null,
-    @SerialName("max_response_output_tokens") val maxResponseOutputTokens: JsonElement? = null,
+    @SerialName("max_output_tokens")
+    @JsonNames("max_response_output_tokens")
+    val maxOutputTokens: JsonElement? = null,
+    val speed: Double? = null,
     @Serializable(with = RealtimeIncludeValueListSerializer::class)
     val include: List<RealtimeIncludeValue>? = null,
     val prompt: JsonObject? = null,
+    val tracing: JsonElement? = null,
 )
 
 @OptIn(ExperimentalSerializationApi::class)

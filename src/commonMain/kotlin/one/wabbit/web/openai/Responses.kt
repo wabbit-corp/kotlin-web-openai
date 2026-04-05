@@ -52,7 +52,11 @@ enum class ResponseRole(val wireName: String) {
     DEVELOPER("developer"),
     USER("user"),
     ASSISTANT("assistant"),
-    TOOL("tool"),
+}
+
+enum class ResponseMessagePhase(val wireName: String) {
+    COMMENTARY("commentary"),
+    FINAL_ANSWER("final_answer"),
 }
 
 sealed interface ResponseInputItem {
@@ -60,16 +64,21 @@ sealed interface ResponseInputItem {
 
     data class Message(
         val role: ResponseRole,
+        val phase: ResponseMessagePhase? = null,
         val content: List<ResponseInputContent>,
     ) : ResponseInputItem {
         init {
             require(content.isNotEmpty()) { "message content must not be empty" }
+            require(phase == null || role == ResponseRole.ASSISTANT) {
+                "message phase is only supported for assistant messages"
+            }
         }
 
         override fun toJson(): JsonObject =
             buildJsonObject {
                 put("type", "message")
                 put("role", role.wireName)
+                phase?.let { put("phase", it.wireName) }
                 putJsonArray("content") {
                     content.forEach { add(it.toJson()) }
                 }
@@ -222,8 +231,10 @@ sealed interface ResponseInputContent {
         override fun toJson(): JsonObject =
             buildJsonObject {
                 put("type", "input_audio")
-                put("data", data)
-                put("format", format.wireName)
+                putJsonObject("input_audio") {
+                    put("data", data)
+                    put("format", format.wireName)
+                }
             }
     }
 
@@ -247,6 +258,34 @@ sealed interface ResponseTool {
         COMPUTER_USE_PREVIEW("computer_use_preview"),
     }
 
+    sealed interface McpAllowedTools {
+        fun toJson(): JsonElement
+
+        data class Filter(
+            val readOnly: Boolean? = null,
+            val toolNames: List<String> = emptyList(),
+        ) : McpAllowedTools {
+            init {
+                require(readOnly != null || toolNames.isNotEmpty()) {
+                    "mcp allowed tools filter must provide readOnly or toolNames"
+                }
+                require(toolNames.all { it.isNotBlank() }) {
+                    "mcp allowed tools filter toolNames must not contain blank values"
+                }
+            }
+
+            override fun toJson(): JsonElement =
+                buildJsonObject {
+                    readOnly?.let { put("read_only", it) }
+                    if (toolNames.isNotEmpty()) {
+                        putJsonArray("tool_names") {
+                            toolNames.forEach { add(JsonPrimitive(it)) }
+                        }
+                    }
+                }
+        }
+    }
+
     sealed interface McpRequireApproval {
         fun toJson(): JsonElement
 
@@ -260,10 +299,13 @@ sealed interface ResponseTool {
 
         data class Filter(
             val policy: Policy,
-            val toolNames: List<String>,
+            val readOnly: Boolean? = null,
+            val toolNames: List<String> = emptyList(),
         ) : McpRequireApproval {
             init {
-                require(toolNames.isNotEmpty()) { "mcp approval filter toolNames must not be empty" }
+                require(readOnly != null || toolNames.isNotEmpty()) {
+                    "mcp approval filter must provide readOnly or toolNames"
+                }
                 require(toolNames.all { it.isNotBlank() }) {
                     "mcp approval filter toolNames must not contain blank values"
                 }
@@ -272,8 +314,11 @@ sealed interface ResponseTool {
             override fun toJson(): JsonElement =
                 buildJsonObject {
                     putJsonObject(policy.wireName) {
-                        putJsonArray("tool_names") {
-                            toolNames.forEach { add(JsonPrimitive(it)) }
+                        readOnly?.let { put("read_only", it) }
+                        if (toolNames.isNotEmpty()) {
+                            putJsonArray("tool_names") {
+                                toolNames.forEach { add(JsonPrimitive(it)) }
+                            }
                         }
                     }
                 }
@@ -460,6 +505,7 @@ sealed interface ResponseTool {
         val serverDescription: String? = null,
         val headers: JsonObject? = null,
         val allowedTools: List<String> = emptyList(),
+        val allowedToolFilter: McpAllowedTools.Filter? = null,
         val requireApproval: McpRequireApproval? = null,
         val extraOptions: JsonExtras? = null,
     ) : ResponseTool {
@@ -474,6 +520,9 @@ sealed interface ResponseTool {
                 "mcp serverDescription must not be blank when set"
             }
             require(allowedTools.all { it.isNotBlank() }) { "mcp allowedTools must not contain blank values" }
+            require(!(allowedTools.isNotEmpty() && allowedToolFilter != null)) {
+                "mcp tool cannot provide allowedTools and allowedToolFilter together"
+            }
         }
 
         override fun toJson(): JsonObject =
@@ -489,6 +538,7 @@ sealed interface ResponseTool {
                         allowedTools.forEach { add(JsonPrimitive(it)) }
                     }
                 }
+                allowedToolFilter?.let { put("allowed_tools", it.toJson()) }
                 requireApproval?.let { put("require_approval", it.toJson()) }
                 putJsonExtras(extraOptions)
             }
@@ -526,9 +576,7 @@ sealed interface ResponseToolChoice {
         override fun toJson(): JsonElement =
             buildJsonObject {
                 put("type", "function")
-                putJsonObject("function") {
-                    put("name", name)
-                }
+                put("name", name)
             }
     }
 
@@ -1046,6 +1094,7 @@ data class ResponseUsage(
 
 enum class ResponseInclude(val wireName: String) {
     WEB_SEARCH_CALL_ACTION_SOURCES("web_search_call.action.sources"),
+    WEB_SEARCH_CALL_RESULTS("web_search_call.results"),
     CODE_INTERPRETER_CALL_OUTPUTS("code_interpreter_call.outputs"),
     COMPUTER_CALL_OUTPUT_IMAGE_URL("computer_call_output.output.image_url"),
     FILE_SEARCH_CALL_RESULTS("file_search_call.results"),
@@ -1211,6 +1260,10 @@ internal object NullableResponseItemTypeSerializer :
 sealed interface ResponseStatus {
     val wireName: String
 
+    data object Queued : ResponseStatus {
+        override val wireName: String = "queued"
+    }
+
     data object InProgress : ResponseStatus {
         override val wireName: String = "in_progress"
     }
@@ -1253,6 +1306,7 @@ internal object ResponseStatusSerializer :
         serialName = "one.wabbit.web.openai.ResponseStatus?",
         knownValues =
             listOf(
+                ResponseStatus.Queued,
                 ResponseStatus.InProgress,
                 ResponseStatus.Completed,
                 ResponseStatus.Incomplete,

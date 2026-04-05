@@ -38,6 +38,7 @@ enum class ResponseServiceTier(val wireName: String) {
     AUTO("auto"),
     DEFAULT("default"),
     FLEX("flex"),
+    SCALE("scale"),
     PRIORITY("priority"),
 }
 

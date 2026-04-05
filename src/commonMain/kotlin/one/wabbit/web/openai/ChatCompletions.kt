@@ -388,6 +388,12 @@ data class ChatCompletionRequest(
         }
         require(stop.all { it.isNotBlank() }) { "stop values must not be blank" }
         require(user == null || user.isNotBlank()) { "chat completion user must not be blank when set" }
+        require(tools.all { it is ResponseTool.Function || it is ResponseTool.Raw }) {
+            "chat completions only support function tools in this client"
+        }
+        require(toolChoice !is ResponseToolChoice.Hosted) {
+            "chat completions do not support hosted tool choices in this client"
+        }
     }
 
     fun requireCompatibleWith(provider: OpenAIProvider) {
@@ -454,10 +460,10 @@ data class ChatCompletionRequest(
             frequencyPenalty?.let { put("frequency_penalty", it) }
             if (tools.isNotEmpty()) {
                 putJsonArray("tools") {
-                    tools.forEach { add(it.toJson()) }
+                    tools.forEach { add(it.toChatJson()) }
                 }
             }
-            toolChoice?.let { put("tool_choice", it.toJson()) }
+            toolChoice?.let { put("tool_choice", it.toChatJson()) }
             parallelToolCalls?.let { put("parallel_tool_calls", it) }
             responseFormat?.let { put("response_format", it.toJson()) }
             if (metadata.isNotEmpty()) {
@@ -483,6 +489,40 @@ data class ChatCompletionRequest(
             putJsonExtras(extraBody)
         }
 }
+
+private fun ResponseTool.toChatJson(): JsonObject =
+    when (this) {
+        is ResponseTool.Function ->
+            buildJsonObject {
+                put("type", "function")
+                putJsonObject("function") {
+                    put("name", name)
+                    description?.let { put("description", it) }
+                    parameters?.let { put("parameters", it) }
+                    strict?.let { put("strict", it) }
+                }
+            }
+        is ResponseTool.Raw -> json
+        else -> error("chat completions only support function tools in this client")
+    }
+
+private fun ResponseToolChoice.toChatJson(): JsonElement =
+    when (this) {
+        ResponseToolChoice.Auto,
+        ResponseToolChoice.Required,
+        ResponseToolChoice.None,
+        is ResponseToolChoice.Raw,
+        -> toJson()
+        is ResponseToolChoice.NamedFunction ->
+            buildJsonObject {
+                put("type", "function")
+                putJsonObject("function") {
+                    put("name", name)
+                }
+            }
+        is ResponseToolChoice.Hosted ->
+            error("chat completions do not support hosted tool choices in this client")
+    }
 
 private fun ChatMessage.hasAudioInput(): Boolean =
     when (val current = content) {
