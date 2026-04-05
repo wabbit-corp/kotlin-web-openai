@@ -158,18 +158,29 @@ data class RealtimeAudioInputConfig(
 
 data class RealtimeAudioOutputConfig(
     val format: RealtimeAudioFormatConfig? = null,
-    val voice: String? = null,
+    val voice: SpeechVoice? = null,
     val speed: Double? = null,
 ) {
+    constructor(
+        format: RealtimeAudioFormatConfig? = null,
+        voice: String? = null,
+        speed: Double? = null,
+    ) : this(
+        format = format,
+        voice = voice?.let(SpeechVoice::BuiltIn),
+        speed = speed,
+    )
+
     init {
-        require(voice == null || voice.isNotBlank()) { "realtime output voice must not be blank when set" }
-        require(speed == null || speed > 0.0) { "realtime output speed must be positive when set" }
+        require(speed == null || speed in 0.25..1.5) {
+            "realtime output speed must be between 0.25 and 1.5 when set"
+        }
     }
 
     fun toJson(): JsonObject =
         buildJsonObject {
             format?.let { put("format", it.toJson()) }
-            voice?.let { put("voice", it) }
+            voice?.let { put("voice", it.toJsonElement()) }
             speed?.let { put("speed", it) }
         }
 }
@@ -183,6 +194,85 @@ data class RealtimeAudioConfig(
             input?.let { put("input", it.toJson()) }
             output?.let { put("output", it.toJson()) }
         }
+}
+
+sealed interface RealtimeTracingConfig {
+    fun toJsonElement(): JsonElement
+
+    data object Auto : RealtimeTracingConfig {
+        override fun toJsonElement(): JsonElement = JsonPrimitive("auto")
+    }
+
+    data object Disabled : RealtimeTracingConfig {
+        override fun toJsonElement(): JsonElement = JsonNull
+    }
+
+    data class Configured(
+        val workflowName: String? = null,
+        val groupId: String? = null,
+        val metadata: JsonElement? = null,
+    ) : RealtimeTracingConfig {
+        init {
+            require(workflowName == null || workflowName.isNotBlank()) {
+                "realtime tracing workflowName must not be blank when set"
+            }
+            require(groupId == null || groupId.isNotBlank()) {
+                "realtime tracing groupId must not be blank when set"
+            }
+        }
+
+        override fun toJsonElement(): JsonElement =
+            buildJsonObject {
+                workflowName?.let { put("workflow_name", it) }
+                groupId?.let { put("group_id", it) }
+                metadata?.let { put("metadata", it) }
+            }
+    }
+}
+
+sealed interface RealtimeTruncation {
+    fun toJsonElement(): JsonElement
+
+    data object Auto : RealtimeTruncation {
+        override fun toJsonElement(): JsonElement = JsonPrimitive("auto")
+    }
+
+    data object Disabled : RealtimeTruncation {
+        override fun toJsonElement(): JsonElement = JsonPrimitive("disabled")
+    }
+
+    data class TokenLimits(
+        val postInstructions: Int? = null,
+    ) {
+        init {
+            require(postInstructions == null || postInstructions >= 0) {
+                "realtime truncation postInstructions must be non-negative when set"
+            }
+        }
+
+        fun toJson(): JsonObject =
+            buildJsonObject {
+                postInstructions?.let { put("post_instructions", it) }
+            }
+    }
+
+    data class RetentionRatio(
+        val retentionRatio: Double,
+        val tokenLimits: TokenLimits? = null,
+    ) : RealtimeTruncation {
+        init {
+            require(retentionRatio in 0.0..1.0) {
+                "realtime truncation retentionRatio must be between 0.0 and 1.0"
+            }
+        }
+
+        override fun toJsonElement(): JsonElement =
+            buildJsonObject {
+                put("type", "retention_ratio")
+                put("retention_ratio", retentionRatio)
+                tokenLimits?.let { put("token_limits", it.toJson()) }
+            }
+    }
 }
 
 @Suppress("LongParameterList")
@@ -202,6 +292,9 @@ data class RealtimeSessionCreateRequest(
     val extraBody: JsonExtras? = null,
 ) {
     init {
+        require(type == RealtimeSessionType.REALTIME) {
+            "realtime sessions must use type=realtime"
+        }
         require(instructions == null || instructions.isNotBlank()) {
             "realtime session instructions must not be blank when set"
         }
@@ -209,8 +302,8 @@ data class RealtimeSessionCreateRequest(
         require(tools.all { it is ResponseTool.Function || it is ResponseTool.Raw }) {
             "realtime bootstrap only supports function tools in this client"
         }
-        require(toolChoice !is ResponseToolChoice.Hosted) {
-            "realtime bootstrap does not support hosted tool choices in this client"
+        require(toolChoice !is ResponseToolChoice.Hosted && toolChoice !is ResponseToolChoice.Mcp) {
+            "legacy realtime bootstrap does not support hosted or MCP tool choices in this client"
         }
     }
 
@@ -228,7 +321,7 @@ data class RealtimeSessionCreateRequest(
             audio?.input?.transcription?.let { put("input_audio_transcription", it.toJson()) }
             audio?.input?.turnDetection?.let { put("turn_detection", it.toJsonElement()) }
             audio?.input?.noiseReduction?.let { put("noise_reduction", it.toJsonElement()) }
-            audio?.output?.voice?.let { put("voice", it) }
+            audio?.output?.voice?.let { put("voice", it.toJsonElement()) }
             audio?.output?.speed?.let { put("speed", it) }
             if (tools.isNotEmpty()) {
                 putJsonArray("tools") {
@@ -247,6 +340,78 @@ data class RealtimeSessionCreateRequest(
                 put("metadata", JsonObject(metadata.mapValues { JsonPrimitive(it.value) }))
             }
             prompt?.let { put("prompt", it) }
+            putJsonExtras(extraBody)
+        }
+}
+
+@Suppress("LongParameterList")
+data class RealtimeSessionConfig(
+    val model: ModelId,
+    val type: RealtimeSessionType = RealtimeSessionType.REALTIME,
+    val outputModalities: List<RealtimeModality> = emptyList(),
+    val instructions: String? = null,
+    val audio: RealtimeAudioConfig? = null,
+    val tools: List<ResponseTool> = emptyList(),
+    val toolChoice: ResponseToolChoice? = null,
+    val maxOutputTokens: JsonElement? = null,
+    val include: List<RealtimeInclude> = emptyList(),
+    val metadata: Map<String, String> = emptyMap(),
+    val prompt: JsonObject? = null,
+    val tracing: RealtimeTracingConfig? = null,
+    val truncation: RealtimeTruncation? = null,
+    val extraBody: JsonExtras? = null,
+) {
+    init {
+        require(type == RealtimeSessionType.REALTIME) {
+            "realtime GA session config must use type=realtime"
+        }
+        require(instructions == null || instructions.isNotBlank()) {
+            "realtime session instructions must not be blank when set"
+        }
+        require(metadata.keys.all { it.isNotBlank() }) { "realtime session metadata keys must not be blank" }
+        require(outputModalities.distinct().size == outputModalities.size) {
+            "realtime session outputModalities must not contain duplicates"
+        }
+        require(outputModalities.size <= 1) {
+            "realtime GA session config cannot request both text and audio output modalities"
+        }
+        require(tools.all { it is ResponseTool.Function || it is ResponseTool.Mcp || it is ResponseTool.Raw }) {
+            "realtime GA session config only supports function and MCP tools in this client"
+        }
+        require(toolChoice !is ResponseToolChoice.Hosted) {
+            "realtime GA session config does not support hosted tool choices in this client"
+        }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("type", type.wireName)
+            put("model", model.value)
+            if (outputModalities.isNotEmpty()) {
+                putJsonArray("output_modalities") {
+                    outputModalities.forEach { add(JsonPrimitive(it.wireName)) }
+                }
+            }
+            instructions?.let { put("instructions", it) }
+            audio?.let { put("audio", it.toJson()) }
+            if (tools.isNotEmpty()) {
+                putJsonArray("tools") {
+                    tools.forEach { add(it.toRealtimeJson()) }
+                }
+            }
+            toolChoice?.let { put("tool_choice", it.toJson()) }
+            maxOutputTokens?.let { put("max_output_tokens", it) }
+            if (include.isNotEmpty()) {
+                putJsonArray("include") {
+                    include.forEach { add(JsonPrimitive(it.wireName)) }
+                }
+            }
+            if (metadata.isNotEmpty()) {
+                put("metadata", JsonObject(metadata.mapValues { JsonPrimitive(it.value) }))
+            }
+            prompt?.let { put("prompt", it) }
+            tracing?.let { put("tracing", it.toJsonElement()) }
+            truncation?.let { put("truncation", it.toJsonElement()) }
             putJsonExtras(extraBody)
         }
 }
@@ -287,6 +452,76 @@ data class RealtimeTranscriptionSessionCreateRequest(
         }
 }
 
+data class RealtimeTranscriptionSessionConfig(
+    val model: ModelId,
+    val type: RealtimeSessionType = RealtimeSessionType.TRANSCRIPTION,
+    val audio: RealtimeAudioConfig,
+    val include: List<RealtimeInclude> = emptyList(),
+    val metadata: Map<String, String> = emptyMap(),
+    val extraBody: JsonExtras? = null,
+) {
+    init {
+        require(type == RealtimeSessionType.TRANSCRIPTION) {
+            "realtime transcription session config must use type=transcription"
+        }
+        require(metadata.keys.all { it.isNotBlank() }) {
+            "realtime transcription session metadata keys must not be blank"
+        }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("type", type.wireName)
+            put("model", model.value)
+            put("audio", audio.toJson())
+            if (include.isNotEmpty()) {
+                putJsonArray("include") {
+                    include.forEach { add(JsonPrimitive(it.wireName)) }
+                }
+            }
+            if (metadata.isNotEmpty()) {
+                put("metadata", JsonObject(metadata.mapValues { JsonPrimitive(it.value) }))
+            }
+            putJsonExtras(extraBody)
+        }
+}
+
+data class RealtimeCallAcceptRequest(
+    val session: RealtimeSessionConfig,
+) {
+    fun toJson(): JsonObject = session.toJson()
+}
+
+data class RealtimeCallReferRequest(
+    val targetUri: String,
+) {
+    init {
+        require(targetUri.isNotBlank()) {
+            "realtime call refer targetUri must not be blank"
+        }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("target_uri", targetUri)
+        }
+}
+
+data class RealtimeCallRejectRequest(
+    val statusCode: Int? = null,
+) {
+    init {
+        require(statusCode == null || statusCode > 0) {
+            "realtime call reject statusCode must be positive when set"
+        }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            statusCode?.let { put("status_code", it) }
+        }
+}
+
 private fun RealtimeAudioFormatConfig.toBootstrapWireName(): String =
     when (type) {
         RealtimeAudioEncoding.AUDIO_PCM -> "pcm16"
@@ -297,9 +532,10 @@ private fun RealtimeAudioFormatConfig.toBootstrapWireName(): String =
 private fun ResponseTool.toRealtimeJson(): JsonObject =
     when (this) {
         is ResponseTool.Function,
+        is ResponseTool.Mcp,
         is ResponseTool.Raw,
         -> toJson()
-        else -> error("realtime bootstrap only supports function tools in this client")
+        else -> error("realtime bootstrap only supports function and MCP tools in this client")
     }
 
 internal fun RealtimeSessionCreateRequest.toClientSecretSessionJson(): JsonObject =

@@ -4,6 +4,7 @@ import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.readUTF8Line
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -53,6 +54,8 @@ private object StreamEventType {
     const val RESPONSE_AUDIO_DONE = "response.audio.done"
     const val RESPONSE_AUDIO_TRANSCRIPT_DELTA = "response.audio.transcript.delta"
     const val RESPONSE_AUDIO_TRANSCRIPT_DONE = "response.audio.transcript.done"
+    const val TRANSCRIPT_TEXT_DELTA = "transcript.text.delta"
+    const val TRANSCRIPT_TEXT_DONE = "transcript.text.done"
 
     const val IMAGE_GENERATION_PARTIAL_IMAGE = "image_generation.partial_image"
     const val IMAGE_EDIT_PARTIAL_IMAGE = "image_edit.partial_image"
@@ -85,7 +88,12 @@ private class ServerSentEventParserState {
     fun finish(): ServerSentEvent? = flush()
 
     private fun flush(): ServerSentEvent? {
-        if (data.isEmpty() && event == null && id == null && retryMillis == null) return null
+        if (data.isEmpty()) {
+            event = null
+            id = null
+            retryMillis = null
+            return null
+        }
         val result =
             ServerSentEvent(
                 event = event,
@@ -363,6 +371,89 @@ sealed interface ImageStreamEvent {
         override val type: String,
         val payload: JsonObject,
     ) : ImageStreamEvent
+}
+
+sealed interface TranscriptionStreamEvent {
+    val type: String
+
+    data object Done : TranscriptionStreamEvent {
+        override val type: String = StreamEventType.DONE
+    }
+
+    data class TextDelta(
+        val delta: String,
+        val logprobs: List<TranscriptionLogProb> = emptyList(),
+    ) : TranscriptionStreamEvent {
+        override val type: String = StreamEventType.TRANSCRIPT_TEXT_DELTA
+    }
+
+    data class TextDone(
+        val text: String,
+        val logprobs: List<TranscriptionLogProb> = emptyList(),
+        val usage: JsonObject? = null,
+    ) : TranscriptionStreamEvent {
+        override val type: String = StreamEventType.TRANSCRIPT_TEXT_DONE
+    }
+
+    data class Error(val error: ResponseApiError) : TranscriptionStreamEvent {
+        override val type: String = StreamEventType.ERROR
+    }
+
+    data class Unknown(
+        override val type: String,
+        val payload: JsonObject,
+    ) : TranscriptionStreamEvent
+}
+
+fun parseTranscriptionStreamEvent(sse: ServerSentEvent): TranscriptionStreamEvent {
+    val body = sse.data.value.trim()
+    if (body == StreamEventType.DONE) return TranscriptionStreamEvent.Done
+    if (body.isEmpty()) {
+        return TranscriptionStreamEvent.Unknown(type = sse.event ?: "unknown", payload = buildJsonObject {})
+    }
+
+    val payload = runCatching { OpenAIJson.parseToJsonElement(body).jsonObject }.getOrNull()
+    if (payload == null) {
+        return if (sse.event == StreamEventType.ERROR) {
+            TranscriptionStreamEvent.Error(parseResponseApiErrorBody(body) ?: ResponseApiError(message = body))
+        } else {
+            TranscriptionStreamEvent.Unknown(
+                type = sse.event ?: "unknown",
+                payload =
+                    buildJsonObject {
+                        put("raw_data", body)
+                    },
+            )
+        }
+    }
+
+    val type = payload["type"]?.jsonPrimitive?.contentOrNull ?: sse.event ?: "unknown"
+    val logprobs =
+        payload["logprobs"]?.let {
+            OpenAIJson.decodeFromJsonElement(ListSerializer(TranscriptionLogProb.serializer()), it)
+        } ?: emptyList()
+
+    return when (type) {
+        StreamEventType.TRANSCRIPT_TEXT_DELTA ->
+            TranscriptionStreamEvent.TextDelta(
+                delta = payload["delta"]?.jsonPrimitive?.content ?: "",
+                logprobs = logprobs,
+            )
+
+        StreamEventType.TRANSCRIPT_TEXT_DONE ->
+            TranscriptionStreamEvent.TextDone(
+                text = payload["text"]?.jsonPrimitive?.content ?: "",
+                logprobs = logprobs,
+                usage = payload["usage"]?.jsonObject,
+            )
+
+        StreamEventType.ERROR ->
+            TranscriptionStreamEvent.Error(
+                parseResponseApiErrorBody(body) ?: ResponseApiError(message = body),
+            )
+
+        else -> TranscriptionStreamEvent.Unknown(type = type, payload = payload)
+    }
 }
 
 fun parseResponseStreamEvent(sse: ServerSentEvent): ResponseStreamEvent {

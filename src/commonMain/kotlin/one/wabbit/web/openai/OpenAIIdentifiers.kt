@@ -63,6 +63,20 @@ value class FineTuningJobId(val value: String) {
 }
 
 @JvmInline
+value class FineTunedModelCheckpointId(val value: String) {
+    init {
+        requireIdentifier(value, "fine-tuned model checkpoint id")
+    }
+}
+
+@JvmInline
+value class FineTuningCheckpointPermissionId(val value: String) {
+    init {
+        requireIdentifier(value, "fine-tuning checkpoint permission id")
+    }
+}
+
+@JvmInline
 value class UploadId(val value: String) {
     init {
         requireIdentifier(value, "upload id")
@@ -91,9 +105,23 @@ value class EvalRunId(val value: String) {
 }
 
 @JvmInline
+value class EvalRunOutputItemId(val value: String) {
+    init {
+        requireIdentifier(value, "eval run output item id")
+    }
+}
+
+@JvmInline
 value class VideoId(val value: String) {
     init {
         requireIdentifier(value, "video id")
+    }
+}
+
+@JvmInline
+value class VideoCharacterId(val value: String) {
+    init {
+        requireIdentifier(value, "video character id")
     }
 }
 
@@ -122,6 +150,13 @@ value class ConversationId(val value: String) {
 value class ConversationItemId(val value: String) {
     init {
         requireIdentifier(value, "conversation item id")
+    }
+}
+
+@JvmInline
+value class RealtimeCallId(val value: String) {
+    init {
+        requireIdentifier(value, "realtime call id")
     }
 }
 

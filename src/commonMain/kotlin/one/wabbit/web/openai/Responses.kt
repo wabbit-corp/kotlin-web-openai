@@ -251,11 +251,18 @@ sealed interface ResponseTool {
     enum class WebSearchType(val wireName: String) {
         WEB_SEARCH("web_search"),
         WEB_SEARCH_PREVIEW("web_search_preview"),
+        WEB_SEARCH_2025_08_26("web_search_2025_08_26"),
+        WEB_SEARCH_PREVIEW_2025_03_11("web_search_preview_2025_03_11"),
     }
 
     enum class ComputerUseType(val wireName: String) {
         COMPUTER_USE("computer_use"),
         COMPUTER_USE_PREVIEW("computer_use_preview"),
+    }
+
+    enum class CustomGrammarSyntax(val wireName: String) {
+        LARK("lark"),
+        REGEX("regex"),
     }
 
     sealed interface McpAllowedTools {
@@ -330,11 +337,85 @@ sealed interface ResponseTool {
         }
     }
 
+    sealed interface CustomInputFormat {
+        fun toJson(): JsonObject
+
+        data class Grammar(
+            val definition: String,
+            val syntax: CustomGrammarSyntax = CustomGrammarSyntax.LARK,
+        ) : CustomInputFormat {
+            init {
+                require(definition.isNotBlank()) { "custom tool grammar definition must not be blank" }
+            }
+
+            override fun toJson(): JsonObject =
+                buildJsonObject {
+                    put("type", "grammar")
+                    put("definition", definition)
+                    put("syntax", syntax.wireName)
+                }
+        }
+
+        data class Raw(
+            val json: JsonObject,
+        ) : CustomInputFormat {
+            override fun toJson(): JsonObject = json
+        }
+    }
+
+    data class LocalSkill(
+        val name: String,
+        val path: String,
+        val description: String? = null,
+    ) {
+        init {
+            require(name.isNotBlank()) { "local skill name must not be blank" }
+            require(path.isNotBlank()) { "local skill path must not be blank" }
+            require(description == null || description.isNotBlank()) {
+                "local skill description must not be blank when set"
+            }
+        }
+
+        fun toJson(): JsonObject =
+            buildJsonObject {
+                put("name", name)
+                put("path", path)
+                description?.let { put("description", it) }
+            }
+    }
+
+    sealed interface ShellEnvironment {
+        fun toJson(): JsonObject
+
+        data class Local(
+            val skills: List<LocalSkill> = emptyList(),
+            val extraOptions: JsonExtras? = null,
+        ) : ShellEnvironment {
+            override fun toJson(): JsonObject =
+                buildJsonObject {
+                    put("type", "local")
+                    if (skills.isNotEmpty()) {
+                        putJsonArray("skills") {
+                            skills.forEach { add(it.toJson()) }
+                        }
+                    }
+                    putJsonExtras(extraOptions)
+                }
+        }
+
+        data class Raw(
+            val json: JsonObject,
+        ) : ShellEnvironment {
+            override fun toJson(): JsonObject = json
+        }
+    }
+
     data class Function(
         val name: String,
         val description: String? = null,
         val parameters: JsonObject? = null,
         val strict: Boolean? = null,
+        val deferLoading: Boolean? = null,
     ) : ResponseTool {
         init {
             require(name.isNotBlank()) { "function tool name must not be blank" }
@@ -347,6 +428,30 @@ sealed interface ResponseTool {
                 description?.let { put("description", it) }
                 parameters?.let { put("parameters", it) }
                 strict?.let { put("strict", it) }
+                deferLoading?.let { put("defer_loading", it) }
+            }
+    }
+
+    data class Custom(
+        val name: String,
+        val description: String? = null,
+        val format: CustomInputFormat? = null,
+        val extraOptions: JsonExtras? = null,
+    ) : ResponseTool {
+        init {
+            require(name.isNotBlank()) { "custom tool name must not be blank" }
+            require(description == null || description.isNotBlank()) {
+                "custom tool description must not be blank when set"
+            }
+        }
+
+        override fun toJson(): JsonObject =
+            buildJsonObject {
+                put("type", "custom")
+                put("name", name)
+                description?.let { put("description", it) }
+                format?.let { put("format", it.toJson()) }
+                putJsonExtras(extraOptions)
             }
     }
 
@@ -439,6 +544,26 @@ sealed interface ResponseTool {
             }
     }
 
+    data object LocalShell : ResponseTool {
+        override fun toJson(): JsonObject = buildJsonObject { put("type", "local_shell") }
+    }
+
+    data class Shell(
+        val environment: ShellEnvironment? = null,
+        val extraOptions: JsonExtras? = null,
+    ) : ResponseTool {
+        override fun toJson(): JsonObject =
+            buildJsonObject {
+                put("type", "shell")
+                environment?.let { put("environment", it.toJson()) }
+                putJsonExtras(extraOptions)
+            }
+    }
+
+    data object ApplyPatch : ResponseTool {
+        override fun toJson(): JsonObject = buildJsonObject { put("type", "apply_patch") }
+    }
+
     data class ComputerUse(
         val toolType: ComputerUseType = ComputerUseType.COMPUTER_USE,
         val environment: String? = null,
@@ -507,6 +632,7 @@ sealed interface ResponseTool {
         val allowedTools: List<String> = emptyList(),
         val allowedToolFilter: McpAllowedTools.Filter? = null,
         val requireApproval: McpRequireApproval? = null,
+        val deferLoading: Boolean? = null,
         val extraOptions: JsonExtras? = null,
     ) : ResponseTool {
         init {
@@ -540,6 +666,7 @@ sealed interface ResponseTool {
                 }
                 allowedToolFilter?.let { put("allowed_tools", it.toJson()) }
                 requireApproval?.let { put("require_approval", it.toJson()) }
+                deferLoading?.let { put("defer_loading", it) }
                 putJsonExtras(extraOptions)
             }
     }
@@ -566,6 +693,20 @@ sealed interface ResponseToolChoice {
         override fun toJson(): JsonElement = JsonPrimitive("none")
     }
 
+    data object Shell : ResponseToolChoice {
+        override fun toJson(): JsonElement =
+            buildJsonObject {
+                put("type", "shell")
+            }
+    }
+
+    data object ApplyPatch : ResponseToolChoice {
+        override fun toJson(): JsonElement =
+            buildJsonObject {
+                put("type", "apply_patch")
+            }
+    }
+
     data class NamedFunction(
         val name: String,
     ) : ResponseToolChoice {
@@ -577,6 +718,37 @@ sealed interface ResponseToolChoice {
             buildJsonObject {
                 put("type", "function")
                 put("name", name)
+            }
+    }
+
+    data class Custom(
+        val name: String,
+    ) : ResponseToolChoice {
+        init {
+            require(name.isNotBlank()) { "custom tool choice name must not be blank" }
+        }
+
+        override fun toJson(): JsonElement =
+            buildJsonObject {
+                put("type", "custom")
+                put("name", name)
+            }
+    }
+
+    data class Mcp(
+        val serverLabel: String,
+        val name: String? = null,
+    ) : ResponseToolChoice {
+        init {
+            require(serverLabel.isNotBlank()) { "mcp tool choice serverLabel must not be blank" }
+            require(name == null || name.isNotBlank()) { "mcp tool choice name must not be blank when set" }
+        }
+
+        override fun toJson(): JsonElement =
+            buildJsonObject {
+                put("type", "mcp")
+                put("server_label", serverLabel)
+                name?.let { put("name", it) }
             }
     }
 
@@ -888,6 +1060,9 @@ data class ResponseCreateRequest(
     val text: ResponseTextConfig? = null,
     val reasoning: ResponseReasoningConfig? = null,
     val truncation: ResponseTruncation? = null,
+    val promptCacheKey: String? = null,
+    val promptCacheRetention: ResponsePromptCacheRetention? = null,
+    val safetyIdentifier: String? = null,
     val user: String? = null,
     val providerOptions: ResponseProviderOptions? = null,
     val extraBody: JsonExtras? = null,
@@ -897,6 +1072,11 @@ data class ResponseCreateRequest(
         require(maxToolCalls == null || maxToolCalls > 0) { "maxToolCalls must be positive when set" }
         require(instructions == null || instructions.isNotBlank()) { "instructions must not be blank when set" }
         require(metadata.keys.all { it.isNotBlank() }) { "metadata keys must not be blank" }
+        require(promptCacheKey == null || promptCacheKey.isNotBlank()) { "promptCacheKey must not be blank when set" }
+        require(safetyIdentifier == null || safetyIdentifier.isNotBlank()) { "safetyIdentifier must not be blank when set" }
+        require(safetyIdentifier == null || safetyIdentifier.length <= 64) {
+            "safetyIdentifier must be at most 64 characters when set"
+        }
         require(user == null || user.isNotBlank()) { "user must not be blank when set" }
     }
 
@@ -952,8 +1132,48 @@ data class ResponseCreateRequest(
             text?.let { put("text", it.toJson()) }
             reasoning?.let { put("reasoning", it.toJson()) }
             truncation?.let { put("truncation", it.wireName) }
+            promptCacheKey?.let { put("prompt_cache_key", it) }
+            promptCacheRetention?.let { put("prompt_cache_retention", it.wireName) }
+            safetyIdentifier?.let { put("safety_identifier", it) }
             user?.let { put("user", it) }
             if (stream) put("stream", true)
+            providerOptions?.applyTo(this)
+            putJsonExtras(extraBody)
+        }
+}
+
+data class ResponseCompactRequest(
+    val model: ModelId,
+    val input: ResponseInput? = null,
+    val instructions: String? = null,
+    val previousResponseId: ResponseId? = null,
+    val promptCacheKey: String? = null,
+    val providerOptions: ResponseProviderOptions? = null,
+    val extraBody: JsonExtras? = null,
+) {
+    init {
+        require(instructions == null || instructions.isNotBlank()) { "instructions must not be blank when set" }
+        require(promptCacheKey == null || promptCacheKey.isNotBlank()) { "promptCacheKey must not be blank when set" }
+    }
+
+    fun requireCompatibleWith(provider: OpenAIProvider) {
+        require(provider.capabilities.responsesApi) {
+            "${provider.id} does not expose the Responses API in this client"
+        }
+        provider.requireStatelessResponses(
+            previousResponseId = previousResponseId,
+            store = null,
+        )
+        providerOptions?.requireCompatibleWith(provider)
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("model", model.value)
+            input?.let { put("input", it.toJson()) }
+            instructions?.let { put("instructions", it) }
+            previousResponseId?.let { put("previous_response_id", it.value) }
+            promptCacheKey?.let { put("prompt_cache_key", it) }
             providerOptions?.applyTo(this)
             putJsonExtras(extraBody)
         }
@@ -1103,6 +1323,25 @@ enum class ResponseInclude(val wireName: String) {
     REASONING_ENCRYPTED_CONTENT("reasoning.encrypted_content"),
 }
 
+data class ResponseRetrieveQuery(
+    val include: List<ResponseInclude> = emptyList(),
+    val includeObfuscation: Boolean? = null,
+    val startingAfter: Long? = null,
+    val stream: Boolean? = null,
+) {
+    init {
+        require(startingAfter == null || startingAfter >= 0) { "startingAfter must be non-negative when set" }
+    }
+
+    internal fun toParameters(): List<Pair<String, String>> =
+        buildList {
+            include.forEach { add("include" to it.wireName) }
+            includeObfuscation?.let { add("include_obfuscation" to it.toString()) }
+            startingAfter?.let { add("starting_after" to it.toString()) }
+            stream?.let { add("stream" to it.toString()) }
+        }
+}
+
 @Serializable
 data class ResponseContentPart(
     val type: String,
@@ -1174,8 +1413,20 @@ sealed interface ResponseItemType {
         override val wireName: String = "custom_tool_call_output"
     }
 
+    data object ShellCall : ResponseItemType {
+        override val wireName: String = "shell_call"
+    }
+
     data object ShellCallOutput : ResponseItemType {
         override val wireName: String = "shell_call_output"
+    }
+
+    data object LocalShellCall : ResponseItemType {
+        override val wireName: String = "local_shell_call"
+    }
+
+    data object LocalShellCallOutput : ResponseItemType {
+        override val wireName: String = "local_shell_call_output"
     }
 
     data object ImageGenerationCall : ResponseItemType {
@@ -1196,6 +1447,18 @@ sealed interface ResponseItemType {
 
     data object ItemReference : ResponseItemType {
         override val wireName: String = "item_reference"
+    }
+
+    data object Compaction : ResponseItemType {
+        override val wireName: String = "compaction"
+    }
+
+    data object ApplyPatchCallOutput : ResponseItemType {
+        override val wireName: String = "apply_patch_call_output"
+    }
+
+    data object ApplyPatchCall : ResponseItemType {
+        override val wireName: String = "apply_patch_call"
     }
 
     data class Unknown(
@@ -1219,12 +1482,18 @@ internal object ResponseItemTypeSerializer :
                 ResponseItemType.ComputerCallOutput,
                 ResponseItemType.CustomToolCall,
                 ResponseItemType.CustomToolCallOutput,
+                ResponseItemType.ShellCall,
                 ResponseItemType.ShellCallOutput,
+                ResponseItemType.LocalShellCall,
+                ResponseItemType.LocalShellCallOutput,
                 ResponseItemType.ImageGenerationCall,
                 ResponseItemType.McpCall,
                 ResponseItemType.McpApprovalResponse,
                 ResponseItemType.XSearchCall,
                 ResponseItemType.ItemReference,
+                ResponseItemType.Compaction,
+                ResponseItemType.ApplyPatchCall,
+                ResponseItemType.ApplyPatchCallOutput,
             ),
         wireName = ResponseItemType::wireName,
         unknown = ResponseItemType::Unknown,
@@ -1246,12 +1515,18 @@ internal object NullableResponseItemTypeSerializer :
                 ResponseItemType.ComputerCallOutput,
                 ResponseItemType.CustomToolCall,
                 ResponseItemType.CustomToolCallOutput,
+                ResponseItemType.ShellCall,
                 ResponseItemType.ShellCallOutput,
+                ResponseItemType.LocalShellCall,
+                ResponseItemType.LocalShellCallOutput,
                 ResponseItemType.ImageGenerationCall,
                 ResponseItemType.McpCall,
                 ResponseItemType.McpApprovalResponse,
                 ResponseItemType.XSearchCall,
                 ResponseItemType.ItemReference,
+                ResponseItemType.Compaction,
+                ResponseItemType.ApplyPatchCall,
+                ResponseItemType.ApplyPatchCallOutput,
             ),
         wireName = ResponseItemType::wireName,
         unknown = ResponseItemType::Unknown,
@@ -1343,8 +1618,11 @@ data class ResponseOutputItem(
     @SerialName("server_label") val serverLabel: String? = null,
     @SerialName("server_url") val serverUrl: String? = null,
     val action: JsonObject? = null,
+    val environment: JsonObject? = null,
+    val operation: JsonObject? = null,
     val input: String? = null,
     @SerialName("approval_request_id") val approvalRequestId: String? = null,
+    @SerialName("encrypted_content") val encryptedContent: String? = null,
     val queries: List<String> = emptyList(),
     val code: String? = null,
     @SerialName("pending_safety_checks") val pendingSafetyChecks: JsonArray? = null,
@@ -1521,6 +1799,19 @@ data class ResponseOutputItem(
             null
         }
 
+    fun asShellCallOrNull(): ResponseShellCall? =
+        if (type == ResponseItemType.ShellCall) {
+            ResponseShellCall(
+                id = id,
+                status = status,
+                callId = callId,
+                action = action,
+                environment = environment,
+            )
+        } else {
+            null
+        }
+
     fun asShellCallOutputOrNull(): ResponseShellCallOutput? =
         if (type == ResponseItemType.ShellCallOutput) {
             ResponseShellCallOutput(
@@ -1533,6 +1824,65 @@ data class ResponseOutputItem(
                     (output as? JsonArray)
                         ?.map { OpenAIJson.decodeFromJsonElement<ResponseShellCallChunk>(it) }
                         .orEmpty(),
+            )
+        } else {
+            null
+        }
+
+    fun asLocalShellCallOrNull(): ResponseLocalShellCall? =
+        if (type == ResponseItemType.LocalShellCall) {
+            ResponseLocalShellCall(
+                id = id,
+                status = status,
+                callId = callId,
+                action = action,
+                environment = environment,
+            )
+        } else {
+            null
+        }
+
+    fun asLocalShellCallOutputOrNull(): ResponseLocalShellCallOutput? =
+        if (type == ResponseItemType.LocalShellCallOutput) {
+            ResponseLocalShellCallOutput(
+                id = id,
+                status = status,
+                output = (output as? JsonPrimitive)?.contentOrNull,
+            )
+        } else {
+            null
+        }
+
+    fun asApplyPatchCallOrNull(): ResponseApplyPatchCall? =
+        if (type == ResponseItemType.ApplyPatchCall) {
+            ResponseApplyPatchCall(
+                id = id,
+                status = status,
+                callId = callId,
+                operation = operation,
+            )
+        } else {
+            null
+        }
+
+    fun asApplyPatchCallOutputOrNull(): ResponseApplyPatchCallOutput? =
+        if (type == ResponseItemType.ApplyPatchCallOutput) {
+            ResponseApplyPatchCallOutput(
+                id = id,
+                status = status,
+                callId = callId,
+                output = (output as? JsonPrimitive)?.contentOrNull,
+            )
+        } else {
+            null
+        }
+
+    fun asCompactionItemOrNull(): ResponseCompactionItem? =
+        if (type == ResponseItemType.Compaction && !encryptedContent.isNullOrBlank()) {
+            ResponseCompactionItem(
+                id = id,
+                encryptedContent = encryptedContent,
+                createdBy = createdBy,
             )
         } else {
             null
@@ -1662,6 +2012,42 @@ data class ResponseShellCallOutput(
     val output: List<ResponseShellCallChunk> = emptyList(),
 )
 
+data class ResponseShellCall(
+    val id: String? = null,
+    val status: ResponseStatus? = null,
+    val callId: String? = null,
+    val action: JsonObject? = null,
+    val environment: JsonObject? = null,
+)
+
+data class ResponseLocalShellCall(
+    val id: String? = null,
+    val status: ResponseStatus? = null,
+    val callId: String? = null,
+    val action: JsonObject? = null,
+    val environment: JsonObject? = null,
+)
+
+data class ResponseLocalShellCallOutput(
+    val id: String? = null,
+    val status: ResponseStatus? = null,
+    val output: String? = null,
+)
+
+data class ResponseApplyPatchCall(
+    val id: String? = null,
+    val status: ResponseStatus? = null,
+    val callId: String? = null,
+    val operation: JsonObject? = null,
+)
+
+data class ResponseApplyPatchCallOutput(
+    val id: String? = null,
+    val status: ResponseStatus? = null,
+    val callId: String? = null,
+    val output: String? = null,
+)
+
 data class ResponseHostedToolCall(
     val id: String? = null,
     val type: ResponseItemType,
@@ -1686,6 +2072,12 @@ data class ResponseMcpCall(
     val serverLabel: String? = null,
     val serverUrl: String? = null,
     val approvalRequestId: String? = null,
+)
+
+data class ResponseCompactionItem(
+    val id: String? = null,
+    val encryptedContent: String,
+    val createdBy: String? = null,
 )
 
 @Serializable
@@ -1714,6 +2106,9 @@ data class ResponseObject(
     val text: JsonObject? = null,
     @SerialName("tool_choice") val toolChoice: JsonElement? = null,
     val tools: JsonArray? = null,
+    @SerialName("prompt_cache_key") val promptCacheKey: String? = null,
+    @SerialName("prompt_cache_retention") val promptCacheRetention: String? = null,
+    @SerialName("safety_identifier") val safetyIdentifier: String? = null,
     @SerialName("top_p") val topP: Double? = null,
     val truncation: String? = null,
     val usage: ResponseUsage? = null,
@@ -1744,7 +2139,19 @@ data class ResponseObject(
 
     fun customToolCallOutputs(): List<ResponseCustomToolCallOutput> = output.mapNotNull { it.asCustomToolCallOutputOrNull() }
 
+    fun shellCalls(): List<ResponseShellCall> = output.mapNotNull { it.asShellCallOrNull() }
+
     fun shellCallOutputs(): List<ResponseShellCallOutput> = output.mapNotNull { it.asShellCallOutputOrNull() }
+
+    fun localShellCalls(): List<ResponseLocalShellCall> = output.mapNotNull { it.asLocalShellCallOrNull() }
+
+    fun localShellCallOutputs(): List<ResponseLocalShellCallOutput> = output.mapNotNull { it.asLocalShellCallOutputOrNull() }
+
+    fun applyPatchCalls(): List<ResponseApplyPatchCall> = output.mapNotNull { it.asApplyPatchCallOrNull() }
+
+    fun applyPatchCallOutputs(): List<ResponseApplyPatchCallOutput> = output.mapNotNull { it.asApplyPatchCallOutputOrNull() }
+
+    fun compactionItems(): List<ResponseCompactionItem> = output.mapNotNull { it.asCompactionItemOrNull() }
 
     fun incompleteReasonOrNull(): ResponseIncompleteReason? = incompleteDetails?.reason
 

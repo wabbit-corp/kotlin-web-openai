@@ -2,6 +2,7 @@ package one.wabbit.web.openai
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -281,10 +282,16 @@ data class EvalRunPage(
 data class EvalRunOutputItemObject(
     val id: String? = null,
     @SerialName("object") val objectType: String? = null,
+    @SerialName("created_at") val createdAt: Long? = null,
+    @SerialName("eval_id") val evalId: String? = null,
+    @SerialName("run_id") val runId: String? = null,
+    @SerialName("datasource_item") val datasourceItem: JsonObject? = null,
+    @SerialName("datasource_item_id") val datasourceItemId: Long? = null,
     @Serializable(with = EvalRunOutputItemStatusSerializer::class)
     val status: EvalRunOutputItemStatus? = null,
     val type: String? = null,
     val sample: JsonObject? = null,
+    val results: JsonArray? = null,
     val result: JsonObject? = null,
     val metadata: JsonObject? = null,
 )

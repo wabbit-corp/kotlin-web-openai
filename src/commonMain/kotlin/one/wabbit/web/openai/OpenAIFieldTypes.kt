@@ -28,9 +28,12 @@ value class ReasoningEffort(
     }
 
     companion object {
+        val NONE = ReasoningEffort("none")
+        val MINIMAL = ReasoningEffort("minimal")
         val LOW = ReasoningEffort("low")
         val MEDIUM = ReasoningEffort("medium")
         val HIGH = ReasoningEffort("high")
+        val XHIGH = ReasoningEffort("xhigh")
     }
 }
 
@@ -45,6 +48,11 @@ enum class ResponseServiceTier(val wireName: String) {
 enum class ResponseTruncation(val wireName: String) {
     AUTO("auto"),
     DISABLED("disabled"),
+}
+
+enum class ResponsePromptCacheRetention(val wireName: String) {
+    IN_MEMORY("in-memory"),
+    HOURS_24("24h"),
 }
 
 enum class ResponseTextVerbosity(val wireName: String) {
@@ -343,14 +351,16 @@ enum class BatchExpirationAnchor(val wireName: String) {
 }
 
 enum class VideoSize(val wireName: String) {
-    X480("480x480"),
-    X720("720x720"),
-    X1080("1080x1080"),
+    P720X1280("720x1280"),
+    P1280X720("1280x720"),
+    P1024X1792("1024x1792"),
+    P1792X1024("1792x1024"),
 }
 
 enum class VideoSeconds(val wireName: String) {
-    S5("5"),
-    S10("10"),
-    S15("15"),
+    S4("4"),
+    S8("8"),
+    S12("12"),
+    S16("16"),
     S20("20"),
 }

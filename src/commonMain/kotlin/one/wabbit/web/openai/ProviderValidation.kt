@@ -101,7 +101,7 @@ internal fun OpenAIProvider.requireStoredChatCompletionsApiSupport() {
 }
 
 internal fun OpenAIProvider.requireConversationsApiSupport() {
-    requireOpenAiOnly("conversations")
+    requireProviderCapability("the conversations API", capabilities.conversationsApi)
 }
 
 internal fun OpenAIProvider.requireDeepSeekOnly(feature: String) {

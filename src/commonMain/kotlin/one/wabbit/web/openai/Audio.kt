@@ -12,6 +12,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonEncoder
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonArray
@@ -25,7 +26,14 @@ enum class SpeechAudioFormat(val wireName: String) {
     AAC("aac"),
     FLAC("flac"),
     WAV("wav"),
-    PCM16("pcm16"),
+    PCM("pcm"),
+
+    ;
+
+    companion object {
+        @Deprecated("Use PCM", ReplaceWith("PCM"))
+        val PCM16: SpeechAudioFormat = PCM
+    }
 }
 
 enum class SpeechStreamFormat(val wireName: String) {
@@ -33,20 +41,68 @@ enum class SpeechStreamFormat(val wireName: String) {
     SSE("sse"),
 }
 
+sealed interface SpeechVoice {
+    fun toJsonElement(): kotlinx.serialization.json.JsonElement
+
+    data class BuiltIn(
+        val name: String,
+    ) : SpeechVoice {
+        init {
+            require(name.isNotBlank()) { "speech voice name must not be blank" }
+        }
+
+        override fun toJsonElement(): kotlinx.serialization.json.JsonElement = JsonPrimitive(name)
+    }
+
+    data class Custom(
+        val id: String,
+    ) : SpeechVoice {
+        init {
+            require(id.isNotBlank()) { "speech voice id must not be blank" }
+        }
+
+        override fun toJsonElement(): kotlinx.serialization.json.JsonElement =
+            buildJsonObject {
+                put("id", id)
+            }
+    }
+}
+
 data class SpeechRequest(
     val model: ModelId,
     val input: String,
-    val voice: String,
+    val voice: SpeechVoice,
     val responseFormat: SpeechAudioFormat? = null,
     val speed: Double? = null,
     val instructions: String? = null,
     val streamFormat: SpeechStreamFormat? = null,
     val extraBody: JsonExtras? = null,
 ) {
+    constructor(
+        model: ModelId,
+        input: String,
+        voice: String,
+        responseFormat: SpeechAudioFormat? = null,
+        speed: Double? = null,
+        instructions: String? = null,
+        streamFormat: SpeechStreamFormat? = null,
+        extraBody: JsonExtras? = null,
+    ) : this(
+        model = model,
+        input = input,
+        voice = SpeechVoice.BuiltIn(voice),
+        responseFormat = responseFormat,
+        speed = speed,
+        instructions = instructions,
+        streamFormat = streamFormat,
+        extraBody = extraBody,
+    )
+
     init {
         require(input.isNotBlank()) { "speech input must not be blank" }
-        require(voice.isNotBlank()) { "speech voice must not be blank" }
-        require(speed == null || speed > 0.0) { "speech speed must be positive when set" }
+        require(speed == null || speed in 0.25..4.0) {
+            "speech speed must be between 0.25 and 4.0 when set"
+        }
         require(instructions == null || instructions.isNotBlank()) {
             "speech instructions must not be blank when set"
         }
@@ -56,7 +112,7 @@ data class SpeechRequest(
         buildJsonObject {
             put("model", model.value)
             put("input", input)
-            put("voice", voice)
+            put("voice", voice.toJsonElement())
             responseFormat?.let { put("response_format", it.wireName) }
             speed?.let { put("speed", it) }
             instructions?.let { put("instructions", it) }
@@ -131,6 +187,83 @@ suspend fun Flow<SpeechStreamEvent>.collectSpeechBytes(): ByteArray {
     }
     return result
 }
+
+data class VoiceCreateRequest(
+    val name: String,
+    val consentId: String,
+    val audioSample: BinaryUpload,
+) {
+    init {
+        require(name.isNotBlank()) { "voice name must not be blank" }
+        require(consentId.isNotBlank()) { "voice consentId must not be blank" }
+    }
+}
+
+data class VoiceConsentCreateRequest(
+    val name: String,
+    val language: String,
+    val recording: BinaryUpload,
+) {
+    init {
+        require(name.isNotBlank()) { "voice consent name must not be blank" }
+        require(language.isNotBlank()) { "voice consent language must not be blank" }
+    }
+}
+
+data class VoiceConsentUpdateRequest(
+    val name: String,
+) {
+    init {
+        require(name.isNotBlank()) { "voice consent name must not be blank" }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("name", name)
+        }
+}
+
+data class VoiceConsentListQuery(
+    val limit: Int = 20,
+    val after: String? = null,
+) {
+    init {
+        require(limit in 1..100) { "voice consent limit must be between 1 and 100" }
+        require(after == null || after.isNotBlank()) { "voice consent after must not be blank when set" }
+    }
+
+    internal fun toParameters(): List<Pair<String, String>> =
+        buildList {
+            add("limit" to limit.toString())
+            after?.let { add("after" to it) }
+        }
+}
+
+@Serializable
+data class AudioVoiceObject(
+    val id: String,
+    @SerialName("created_at") val createdAt: Long? = null,
+    val name: String? = null,
+    @SerialName("object") val objectType: String? = null,
+)
+
+@Serializable
+data class VoiceConsentObject(
+    val id: String,
+    @SerialName("created_at") val createdAt: Long? = null,
+    val language: String? = null,
+    val name: String? = null,
+    @SerialName("object") val objectType: String? = null,
+)
+
+@Serializable
+data class VoiceConsentPage(
+    @SerialName("object") val objectType: String? = null,
+    val data: List<VoiceConsentObject> = emptyList(),
+    @SerialName("first_id") val firstId: String? = null,
+    @SerialName("last_id") val lastId: String? = null,
+    @SerialName("has_more") val hasMore: Boolean = false,
+)
 
 @Serializable
 enum class AudioTextResponseFormat(val wireName: String) {
@@ -247,6 +380,9 @@ data class TranscriptionRequest(
         }
         require(knownSpeakerNames.size == knownSpeakerReferences.size) {
             "transcription knownSpeakerNames and knownSpeakerReferences must have the same size"
+        }
+        require(knownSpeakerNames.size <= 4) {
+            "transcription supports at most 4 knownSpeakerNames"
         }
         require(language == null || language.isNotBlank()) { "transcription language must not be blank when set" }
         require(prompt == null || prompt.isNotBlank()) { "transcription prompt must not be blank when set" }

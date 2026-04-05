@@ -44,6 +44,7 @@ data class ResponseInputTokensUsage(
 @Serializable
 data class ResponseInputTokensResult(
     @SerialName("object") val objectType: String? = null,
+    @SerialName("input_tokens") val inputTokens: Int? = null,
     val usage: ResponseInputTokensUsage? = null,
 )
 
@@ -100,6 +101,69 @@ data class ConversationItemListQuery(
             add("limit" to limit.toString())
             add("order" to order.wireName)
             after?.let { add("after" to it) }
+        }
+}
+
+data class ConversationCreateRequest(
+    val items: List<ResponseInputItem> = emptyList(),
+    val metadata: Map<String, String> = emptyMap(),
+) {
+    init {
+        require(items.size <= 20) { "conversation create supports at most 20 items" }
+        require(metadata.keys.all { it.isNotBlank() }) { "conversation metadata keys must not be blank" }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            if (items.isNotEmpty()) {
+                put("items", kotlinx.serialization.json.JsonArray(items.map { it.toJson() }))
+            }
+            if (metadata.isNotEmpty()) {
+                put(
+                    "metadata",
+                    buildJsonObject {
+                        metadata.forEach { (key, value) -> put(key, value) }
+                    },
+                )
+            }
+        }
+}
+
+data class ConversationUpdateRequest(
+    val metadata: Map<String, String>,
+) {
+    init {
+        require(metadata.keys.all { it.isNotBlank() }) { "conversation metadata keys must not be blank" }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put(
+                "metadata",
+                buildJsonObject {
+                    metadata.forEach { (key, value) -> put(key, value) }
+                },
+            )
+        }
+}
+
+data class ConversationItemCreateRequest(
+    val items: List<ResponseInputItem>,
+    val include: List<ResponseInclude> = emptyList(),
+) {
+    init {
+        require(items.isNotEmpty()) { "conversation item create must contain at least one item" }
+        require(items.size <= 20) { "conversation item create supports at most 20 items" }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("items", kotlinx.serialization.json.JsonArray(items.map { it.toJson() }))
+        }
+
+    internal fun toParameters(): List<Pair<String, String>> =
+        buildList {
+            include.forEach { add("include" to it.wireName) }
         }
 }
 

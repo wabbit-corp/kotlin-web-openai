@@ -325,6 +325,25 @@ data class VectorStoreFileCreateRequest(
         }
 }
 
+data class VectorStoreFileUpdateRequest(
+    val attributes: JsonObject? = null,
+    val chunkingStrategy: VectorStoreChunkingStrategy? = null,
+    val extraBody: JsonExtras? = null,
+) {
+    init {
+        require(attributes == null || attributes.keys.all { it.isNotBlank() }) {
+            "vector store file update attribute keys must not be blank when set"
+        }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            attributes?.let { put("attributes", it) }
+            chunkingStrategy?.let { put("chunking_strategy", it.toJson()) }
+            putJsonExtras(extraBody)
+        }
+}
+
 enum class VectorStoreFileListOrder(val wireName: String) {
     ASC("asc"),
     DESC("desc"),
@@ -481,6 +500,23 @@ data class VectorStoreFilePage(
     @SerialName("first_id") val firstId: String? = null,
     @SerialName("last_id") val lastId: String? = null,
     @SerialName("has_more") val hasMore: Boolean = false,
+)
+
+@Serializable
+data class VectorStoreFileContentPart(
+    val type: String? = null,
+    val text: String? = null,
+)
+
+@Serializable
+data class VectorStoreFileContentPage(
+    @SerialName("file_id") val fileId: String? = null,
+    val filename: String? = null,
+    val attributes: JsonObject? = null,
+    val content: List<VectorStoreFileContentPart> = emptyList(),
+    @SerialName("object") val objectType: String? = null,
+    @SerialName("has_more") val hasMore: Boolean = false,
+    @SerialName("next_page") val nextPage: String? = null,
 )
 
 @Serializable

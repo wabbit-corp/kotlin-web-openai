@@ -289,6 +289,74 @@ data class FineTuningCheckpointListQuery(
         }
 }
 
+enum class FineTuningCheckpointPermissionOrder(val wireName: String) {
+    ASCENDING("ascending"),
+    DESCENDING("descending"),
+}
+
+data class FineTuningCheckpointPermissionCreateRequest(
+    val projectIds: List<String>,
+) {
+    init {
+        require(projectIds.isNotEmpty()) { "checkpoint permission projectIds must not be empty" }
+        require(projectIds.all { it.isNotBlank() }) { "checkpoint permission projectIds must not contain blank values" }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            putJsonArray("project_ids") {
+                projectIds.forEach { add(JsonPrimitive(it)) }
+            }
+        }
+}
+
+data class FineTuningCheckpointPermissionListQuery(
+    val after: String? = null,
+    val limit: Int = 20,
+    val order: FineTuningCheckpointPermissionOrder = FineTuningCheckpointPermissionOrder.DESCENDING,
+    val projectId: String? = null,
+) {
+    init {
+        require(after == null || after.isNotBlank()) { "checkpoint permissions after must not be blank when set" }
+        require(limit in 1..100) { "checkpoint permissions limit must be between 1 and 100" }
+        require(projectId == null || projectId.isNotBlank()) { "checkpoint permissions projectId must not be blank when set" }
+    }
+
+    internal fun toParameters(): List<Pair<String, String>> =
+        buildList {
+            after?.let { add("after" to it) }
+            add("limit" to limit.toString())
+            add("order" to order.wireName)
+            projectId?.let { add("project_id" to it) }
+        }
+}
+
+data class FineTuningGraderRunRequest(
+    val grader: JsonObject,
+    val item: JsonElement? = null,
+    val modelSample: JsonElement? = null,
+    val extraBody: JsonExtras? = null,
+) {
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("grader", grader)
+            item?.let { put("item", it) }
+            modelSample?.let { put("model_sample", it) }
+            putJsonExtras(extraBody)
+        }
+}
+
+data class FineTuningGraderValidateRequest(
+    val grader: JsonObject,
+    val extraBody: JsonExtras? = null,
+) {
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("grader", grader)
+            putJsonExtras(extraBody)
+        }
+}
+
 @Serializable
 data class FineTuningJob(
     val id: String,
@@ -374,4 +442,41 @@ data class FineTuningCheckpointPage(
     @SerialName("first_id") val firstId: String? = null,
     @SerialName("last_id") val lastId: String? = null,
     @SerialName("has_more") val hasMore: Boolean = false,
+)
+
+@Serializable
+data class FineTuningCheckpointPermission(
+    val id: String,
+    @SerialName("object") val objectType: String? = null,
+    @SerialName("created_at") val createdAt: Long? = null,
+    @SerialName("project_id") val projectId: String? = null,
+)
+
+@Serializable
+data class FineTuningCheckpointPermissionPage(
+    @SerialName("object") val objectType: String? = null,
+    val data: List<FineTuningCheckpointPermission> = emptyList(),
+    @SerialName("first_id") val firstId: String? = null,
+    @SerialName("last_id") val lastId: String? = null,
+    @SerialName("has_more") val hasMore: Boolean = false,
+)
+
+@Serializable
+data class FineTuningCheckpointPermissionDeleted(
+    val id: String,
+    @SerialName("object") val objectType: String? = null,
+    val deleted: Boolean = false,
+)
+
+@Serializable
+data class FineTuningGraderRunResult(
+    val reward: Double? = null,
+    val metadata: JsonObject? = null,
+    @SerialName("sub_rewards") val subRewards: JsonObject? = null,
+    @SerialName("model_grader_token_usage_per_model") val modelGraderTokenUsagePerModel: JsonObject? = null,
+)
+
+@Serializable
+data class FineTuningGraderValidateResult(
+    val grader: JsonObject,
 )

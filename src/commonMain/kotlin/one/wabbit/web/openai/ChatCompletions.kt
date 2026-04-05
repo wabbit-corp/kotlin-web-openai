@@ -391,8 +391,8 @@ data class ChatCompletionRequest(
         require(tools.all { it is ResponseTool.Function || it is ResponseTool.Raw }) {
             "chat completions only support function tools in this client"
         }
-        require(toolChoice !is ResponseToolChoice.Hosted) {
-            "chat completions do not support hosted tool choices in this client"
+        require(toolChoice !is ResponseToolChoice.Hosted && toolChoice !is ResponseToolChoice.Mcp) {
+            "chat completions do not support hosted or MCP tool choices in this client"
         }
     }
 
@@ -503,6 +503,11 @@ private fun ResponseTool.toChatJson(): JsonObject =
                 }
             }
         is ResponseTool.Raw -> json
+        is ResponseTool.Custom,
+        ResponseTool.LocalShell,
+        is ResponseTool.Shell,
+        ResponseTool.ApplyPatch,
+        -> error("chat completions only support function tools in this client")
         else -> error("chat completions only support function tools in this client")
     }
 
@@ -520,6 +525,14 @@ private fun ResponseToolChoice.toChatJson(): JsonElement =
                     put("name", name)
                 }
             }
+        ResponseToolChoice.Shell ->
+            error("chat completions do not support shell tool choices in this client")
+        ResponseToolChoice.ApplyPatch ->
+            error("chat completions do not support apply-patch tool choices in this client")
+        is ResponseToolChoice.Custom ->
+            error("chat completions do not support custom tool choices in this client")
+        is ResponseToolChoice.Mcp ->
+            error("chat completions do not support MCP tool choices in this client")
         is ResponseToolChoice.Hosted ->
             error("chat completions do not support hosted tool choices in this client")
     }

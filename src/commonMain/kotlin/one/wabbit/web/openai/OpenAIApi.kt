@@ -13,6 +13,7 @@ import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
+import io.ktor.client.request.prepareGet
 import io.ktor.client.request.preparePost
 import io.ktor.client.request.setBody
 import io.ktor.client.request.forms.FormBuilder
@@ -28,6 +29,7 @@ import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.buildJsonArray
@@ -76,7 +78,9 @@ interface OpenAIApi {
     val config: Config
 
     suspend fun createResponse(request: ResponseCreateRequest): ResponseObject
-    suspend fun getResponse(responseId: ResponseId): ResponseObject
+    suspend fun getResponse(responseId: ResponseId, query: ResponseRetrieveQuery = ResponseRetrieveQuery()): ResponseObject
+    suspend fun deleteResponse(responseId: ResponseId): DeletedObject
+    suspend fun compactResponse(request: ResponseCompactRequest): ResponseObject
     suspend fun cancelResponse(responseId: ResponseId): ResponseObject
     suspend fun listResponses(query: ResponseListQuery = ResponseListQuery()): ResponsePage
     suspend fun listResponseInputItems(
@@ -88,6 +92,7 @@ interface OpenAIApi {
     suspend fun createEmbedding(request: EmbeddingCreateRequest): EmbeddingResponse
     suspend fun listModels(): ModelPage
     suspend fun getModel(modelId: ModelId): ModelObject
+    suspend fun deleteModel(modelId: ModelId): DeletedObject
     suspend fun generateImage(request: ImageGenerateRequest): ImagesResponse
     suspend fun editImage(request: ImageEditRequest): ImagesResponse
     suspend fun createImageVariation(request: ImageVariationRequest): ImagesResponse
@@ -112,7 +117,22 @@ interface OpenAIApi {
         jobId: FineTuningJobId,
         query: FineTuningCheckpointListQuery = FineTuningCheckpointListQuery(),
     ): FineTuningCheckpointPage
+    suspend fun createFineTuningCheckpointPermissions(
+        checkpointId: FineTunedModelCheckpointId,
+        request: FineTuningCheckpointPermissionCreateRequest,
+    ): FineTuningCheckpointPermissionPage
+    suspend fun listFineTuningCheckpointPermissions(
+        checkpointId: FineTunedModelCheckpointId,
+        query: FineTuningCheckpointPermissionListQuery = FineTuningCheckpointPermissionListQuery(),
+    ): FineTuningCheckpointPermissionPage
+    suspend fun deleteFineTuningCheckpointPermission(
+        checkpointId: FineTunedModelCheckpointId,
+        permissionId: FineTuningCheckpointPermissionId,
+    ): FineTuningCheckpointPermissionDeleted
+    suspend fun runFineTuningGrader(request: FineTuningGraderRunRequest): FineTuningGraderRunResult
+    suspend fun validateFineTuningGrader(request: FineTuningGraderValidateRequest): FineTuningGraderValidateResult
     fun streamResponse(request: ResponseCreateRequest): Flow<ResponseStreamEvent>
+    fun streamResponse(responseId: ResponseId, query: ResponseRetrieveQuery = ResponseRetrieveQuery(stream = true)): Flow<ResponseStreamEvent>
     suspend fun createChatCompletion(request: ChatCompletionRequest): ChatCompletionResponse
     suspend fun getStoredChatCompletion(completionId: ChatCompletionId): ChatCompletionResponse
     suspend fun listStoredChatCompletions(query: StoredChatCompletionListQuery = StoredChatCompletionListQuery()): StoredChatCompletionPage
@@ -122,7 +142,14 @@ interface OpenAIApi {
     suspend fun createDeepSeekFimCompletion(request: DeepSeekFimCompletionRequest): DeepSeekFimCompletionResponse
     suspend fun createSpeech(request: SpeechRequest): ByteArray
     fun streamSpeech(request: SpeechRequest): Flow<SpeechStreamEvent>
+    suspend fun createVoice(request: VoiceCreateRequest): AudioVoiceObject
+    suspend fun createVoiceConsent(request: VoiceConsentCreateRequest): VoiceConsentObject
+    suspend fun getVoiceConsent(consentId: String): VoiceConsentObject
+    suspend fun updateVoiceConsent(consentId: String, request: VoiceConsentUpdateRequest): VoiceConsentObject
+    suspend fun deleteVoiceConsent(consentId: String): DeletedObject
+    suspend fun listVoiceConsents(query: VoiceConsentListQuery = VoiceConsentListQuery()): VoiceConsentPage
     suspend fun createTranscription(request: TranscriptionRequest): TranscriptionResult
+    fun streamTranscription(request: TranscriptionRequest): Flow<TranscriptionStreamEvent>
     suspend fun createTranslation(request: TranslationRequest): TranslationResult
     suspend fun uploadFile(request: FileCreateRequest): OpenAIFile
     suspend fun getFile(fileId: FileId): OpenAIFile
@@ -140,10 +167,18 @@ interface OpenAIApi {
     suspend fun deleteVectorStore(vectorStoreId: VectorStoreId): DeletedObject
     suspend fun searchVectorStore(vectorStoreId: VectorStoreId, request: VectorStoreSearchRequest): VectorStoreSearchResponse
     suspend fun createVectorStoreFile(vectorStoreId: VectorStoreId, request: VectorStoreFileCreateRequest): VectorStoreFileObject
+    suspend fun getVectorStoreFile(vectorStoreId: VectorStoreId, fileId: FileId): VectorStoreFileObject
+    suspend fun getVectorStoreFileContent(vectorStoreId: VectorStoreId, fileId: FileId): VectorStoreFileContentPage
     suspend fun listVectorStoreFiles(
         vectorStoreId: VectorStoreId,
         query: VectorStoreFileListQuery = VectorStoreFileListQuery(),
     ): VectorStoreFilePage
+    suspend fun updateVectorStoreFile(
+        vectorStoreId: VectorStoreId,
+        fileId: FileId,
+        request: VectorStoreFileUpdateRequest,
+    ): VectorStoreFileObject
+    suspend fun deleteVectorStoreFile(vectorStoreId: VectorStoreId, fileId: FileId): DeletedObject
     suspend fun createVectorStoreFileBatch(
         vectorStoreId: VectorStoreId,
         request: VectorStoreFileBatchCreateRequest,
@@ -154,7 +189,18 @@ interface OpenAIApi {
         vectorStoreId: VectorStoreId,
         query: VectorStoreFileBatchListQuery = VectorStoreFileBatchListQuery(),
     ): VectorStoreFileBatchPage
+    suspend fun listVectorStoreFileBatchFiles(
+        vectorStoreId: VectorStoreId,
+        batchId: VectorStoreFileBatchId,
+        query: VectorStoreFileBatchListQuery = VectorStoreFileBatchListQuery(),
+    ): VectorStoreFilePage
+    suspend fun createConversation(request: ConversationCreateRequest): ConversationObject
+    suspend fun updateConversation(conversationId: ConversationId, request: ConversationUpdateRequest): ConversationObject
     suspend fun getConversation(conversationId: ConversationId): ConversationObject
+    suspend fun createConversationItems(
+        conversationId: ConversationId,
+        request: ConversationItemCreateRequest,
+    ): ConversationItemPage
     suspend fun listConversationItems(
         conversationId: ConversationId,
         query: ConversationItemListQuery = ConversationItemListQuery(),
@@ -165,13 +211,17 @@ interface OpenAIApi {
     suspend fun createRealtimeSession(request: RealtimeSessionCreateRequest): RealtimeSessionObject
     suspend fun createRealtimeTranscriptionSession(request: RealtimeTranscriptionSessionCreateRequest): RealtimeSessionObject
     suspend fun createRealtimeClientSecret(
-        session: RealtimeSessionCreateRequest,
+        session: RealtimeSessionConfig,
         expiresAfter: RealtimeClientSecretExpiration? = null,
     ): RealtimeClientSecretResponse
     suspend fun createRealtimeClientSecret(
-        session: RealtimeTranscriptionSessionCreateRequest,
+        session: RealtimeTranscriptionSessionConfig,
         expiresAfter: RealtimeClientSecretExpiration? = null,
     ): RealtimeClientSecretResponse
+    suspend fun acceptRealtimeCall(callId: RealtimeCallId, request: RealtimeCallAcceptRequest)
+    suspend fun hangupRealtimeCall(callId: RealtimeCallId)
+    suspend fun referRealtimeCall(callId: RealtimeCallId, request: RealtimeCallReferRequest)
+    suspend fun rejectRealtimeCall(callId: RealtimeCallId, request: RealtimeCallRejectRequest = RealtimeCallRejectRequest())
     suspend fun createEval(request: EvalCreateRequest): EvalObject
     suspend fun getEval(evalId: EvalId): EvalObject
     suspend fun listEvals(query: EvalListQuery = EvalListQuery()): EvalPage
@@ -182,12 +232,22 @@ interface OpenAIApi {
     suspend fun listEvalRuns(evalId: EvalId, query: EvalRunListQuery = EvalRunListQuery()): EvalRunPage
     suspend fun updateEvalRun(evalId: EvalId, runId: EvalRunId, request: EvalRunUpdateRequest): EvalRunObject
     suspend fun deleteEvalRun(evalId: EvalId, runId: EvalRunId): DeletedObject
+    suspend fun cancelEvalRun(evalId: EvalId, runId: EvalRunId): EvalRunObject
+    suspend fun getEvalRunOutputItem(
+        evalId: EvalId,
+        runId: EvalRunId,
+        outputItemId: EvalRunOutputItemId,
+    ): EvalRunOutputItemObject
     suspend fun listEvalRunOutputItems(
         evalId: EvalId,
         runId: EvalRunId,
         query: EvalRunOutputItemListQuery = EvalRunOutputItemListQuery(),
     ): EvalRunOutputItemPage
     suspend fun createVideo(request: VideoCreateRequest): VideoObject
+    suspend fun createVideoCharacter(request: VideoCharacterCreateRequest): VideoCharacterObject
+    suspend fun getVideoCharacter(characterId: VideoCharacterId): VideoCharacterObject
+    suspend fun editVideo(request: VideoEditRequest): VideoObject
+    suspend fun extendVideo(request: VideoExtendRequest): VideoObject
     suspend fun remixVideo(videoId: VideoId, request: VideoRemixRequest): VideoObject
     suspend fun listVideos(query: VideoListQuery = VideoListQuery()): VideoPage
     suspend fun getVideo(videoId: VideoId): VideoObject
@@ -315,11 +375,60 @@ class KtorOpenAIApi(
         }
     }
 
-    override suspend fun getResponse(responseId: ResponseId): ResponseObject =
+    override fun streamResponse(responseId: ResponseId, query: ResponseRetrieveQuery): Flow<ResponseStreamEvent> = flow {
+        provider.requireStatefulResponsesApiSupport()
+        val effectiveQuery = if (query.stream == null) query.copy(stream = true) else query
+        require(effectiveQuery.stream != false) {
+            "streamResponse(responseId, ...) requires stream=true or unset"
+        }
+        val url = "${responsesUrl()}/${responseId.value}"
+        val statement =
+            try {
+                httpClient.prepareGet(url) {
+                    expectSuccess = false
+                    accept(ContentType.Text.EventStream)
+                    applyEtiquette(config.etiquette)
+                    applyTimeouts(effectiveStreamingTimeouts)
+                    provider.applyRequest(config.apiKey, this)
+                    effectiveQuery.toParameters().forEach { (key, value) -> parameter(key, value) }
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                if (t is OpenAIApiError) throw t
+                throw OpenAIApiError.Network(url, t)
+            }
+
+        statement.execute { response ->
+            observeResponseMetadata(url, response)
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, response.bodyAsText(), response.headers)
+            }
+            throwUnexpectedSuccessfulNonStreamResponse(url, response, "Responses streaming retrieval")
+            wrapStreamingTransport(url) {
+                collectServerSentEvents(response.bodyAsChannel()) { sse ->
+                    val event =
+                        try {
+                            parseResponseStreamEvent(sse)
+                        } catch (t: Throwable) {
+                            throw OpenAIApiError.Parse(url, t, bodySample = sse.data.value.take(2048))
+                        }
+                    emit(event)
+                }
+            }
+        }
+    }
+
+    override suspend fun getResponse(responseId: ResponseId, query: ResponseRetrieveQuery): ResponseObject =
         withRetry {
             provider.requireStatefulResponsesApiSupport()
+            require(query.stream != true) {
+                "Use streamResponse(responseId, query.copy(stream = true)) for streamed response retrieval"
+            }
             val url = "${responsesUrl()}/${responseId.value}"
-            val response = getRequest(url)
+            val response =
+                getRequest(url) {
+                    query.toParameters().forEach { (key, value) -> parameter(key, value) }
+                }
             val body = response.bodyAsText()
             if (!response.status.isSuccess()) {
                 throw decodeError(url, response.status.value, body, response.headers)
@@ -329,6 +438,31 @@ class KtorOpenAIApi(
             } catch (t: Throwable) {
                 throw OpenAIApiError.Parse(url, t, bodySample = body.take(2048))
             }
+        }
+
+    override suspend fun deleteResponse(responseId: ResponseId): DeletedObject =
+        withRetry {
+            provider.requireStatefulResponsesApiSupport()
+            val url = "${responsesUrl()}/${responseId.value}"
+            val response = deleteRequest(url)
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun compactResponse(request: ResponseCompactRequest): ResponseObject =
+        withNonIdempotentRetry {
+            provider.requireStatefulResponsesApiSupport()
+            request.requireCompatibleWith(provider)
+            val url = "${responsesUrl()}/compact"
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
         }
 
     override suspend fun cancelResponse(responseId: ResponseId): ResponseObject =
@@ -429,6 +563,18 @@ class KtorOpenAIApi(
             provider.requireModelsApiSupport()
             val url = "${modelsUrl()}/${modelId.value}"
             val response = getRequest(url)
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun deleteModel(modelId: ModelId): DeletedObject =
+        withRetry {
+            provider.requireOpenAiOnly("model deletion")
+            val url = "${modelsUrl()}/${modelId.value}"
+            val response = deleteRequest(url)
             val body = response.bodyAsText()
             if (!response.status.isSuccess()) {
                 throw decodeError(url, response.status.value, body, response.headers)
@@ -743,6 +889,78 @@ class KtorOpenAIApi(
             decodeJsonBody(url, body)
         }
 
+    override suspend fun createFineTuningCheckpointPermissions(
+        checkpointId: FineTunedModelCheckpointId,
+        request: FineTuningCheckpointPermissionCreateRequest,
+    ): FineTuningCheckpointPermissionPage =
+        withNonIdempotentRetry {
+            provider.requireFineTuningApiSupport()
+            val url = fineTuningCheckpointPermissionsUrl(checkpointId)
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun listFineTuningCheckpointPermissions(
+        checkpointId: FineTunedModelCheckpointId,
+        query: FineTuningCheckpointPermissionListQuery,
+    ): FineTuningCheckpointPermissionPage =
+        withRetry {
+            provider.requireFineTuningApiSupport()
+            val url = fineTuningCheckpointPermissionsUrl(checkpointId)
+            val response =
+                getRequest(url) {
+                    query.toParameters().forEach { (key, value) -> parameter(key, value) }
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun deleteFineTuningCheckpointPermission(
+        checkpointId: FineTunedModelCheckpointId,
+        permissionId: FineTuningCheckpointPermissionId,
+    ): FineTuningCheckpointPermissionDeleted =
+        withRetry {
+            provider.requireFineTuningApiSupport()
+            val url = "${fineTuningCheckpointPermissionsUrl(checkpointId)}/${permissionId.value}"
+            val response = deleteRequest(url)
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun runFineTuningGrader(request: FineTuningGraderRunRequest): FineTuningGraderRunResult =
+        withNonIdempotentRetry {
+            provider.requireFineTuningApiSupport()
+            val url = fineTuningGradersRunUrl()
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun validateFineTuningGrader(request: FineTuningGraderValidateRequest): FineTuningGraderValidateResult =
+        withNonIdempotentRetry {
+            provider.requireFineTuningApiSupport()
+            val url = fineTuningGradersValidateUrl()
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
     override suspend fun createChatCompletion(request: ChatCompletionRequest): ChatCompletionResponse =
         withNonIdempotentRetry {
             request.requireCompatibleWith(provider)
@@ -937,28 +1155,105 @@ class KtorOpenAIApi(
         }
     }
 
+    override suspend fun createVoice(request: VoiceCreateRequest): AudioVoiceObject =
+        withNonIdempotentRetry {
+            provider.requireOpenAiOnly("custom voices")
+            val url = audioVoicesUrl()
+            val response =
+                postMultipart(url, accept = ContentType.Application.Json.toString()) {
+                    append("name", request.name)
+                    append("consent", request.consentId)
+                    appendBinaryUpload("audio_sample", request.audioSample)
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun createVoiceConsent(request: VoiceConsentCreateRequest): VoiceConsentObject =
+        withNonIdempotentRetry {
+            provider.requireOpenAiOnly("voice consents")
+            val url = audioVoiceConsentsUrl()
+            val response =
+                postMultipart(url, accept = ContentType.Application.Json.toString()) {
+                    append("name", request.name)
+                    append("language", request.language)
+                    appendBinaryUpload("recording", request.recording)
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun getVoiceConsent(consentId: String): VoiceConsentObject =
+        withRetry {
+            provider.requireOpenAiOnly("voice consents")
+            require(consentId.isNotBlank()) { "consentId must not be blank" }
+            val url = "${audioVoiceConsentsUrl()}/$consentId"
+            val response = getRequest(url)
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun updateVoiceConsent(consentId: String, request: VoiceConsentUpdateRequest): VoiceConsentObject =
+        withNonIdempotentRetry {
+            provider.requireOpenAiOnly("voice consents")
+            require(consentId.isNotBlank()) { "consentId must not be blank" }
+            val url = "${audioVoiceConsentsUrl()}/$consentId"
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun deleteVoiceConsent(consentId: String): DeletedObject =
+        withRetry {
+            provider.requireOpenAiOnly("voice consents")
+            require(consentId.isNotBlank()) { "consentId must not be blank" }
+            val url = "${audioVoiceConsentsUrl()}/$consentId"
+            val response = deleteRequest(url)
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun listVoiceConsents(query: VoiceConsentListQuery): VoiceConsentPage =
+        withRetry {
+            provider.requireOpenAiOnly("voice consents")
+            val url = audioVoiceConsentsUrl()
+            val response =
+                getRequest(url) {
+                    query.toParameters().forEach { (key, value) -> parameter(key, value) }
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
     override suspend fun createTranscription(request: TranscriptionRequest): TranscriptionResult =
         withNonIdempotentRetry {
             provider.requireAudioApiSupport()
+            requireKnownOpenAiTranscriptionCompatibility(provider, request)
             require(request.stream != true) {
-                "Streaming audio transcriptions are not implemented in this client yet"
+                "createTranscription does not support stream=true; use streamTranscription instead"
             }
             val url = transcriptionUrl()
             val response =
                 postMultipart(url, accept = "*/*") {
-                    appendBinaryUpload("file", request.file)
-                    append("model", request.model.value)
-                    request.chunkingStrategy?.let { appendChunkingStrategy(it) }
-                    request.knownSpeakerNames.forEach { append("known_speaker_names[]", it) }
-                    request.knownSpeakerReferences.forEach { append("known_speaker_references[]", it) }
-                    request.language?.let { append("language", it) }
-                    request.prompt?.let { append("prompt", it) }
-                    request.responseFormat?.let { append("response_format", it.wireName) }
-                    request.stream?.let { append("stream", it.toString()) }
-                    request.temperature?.let { append("temperature", it.toString()) }
-                    request.include.forEach { append("include[]", it.wireName) }
-                    request.timestampGranularities.forEach { append("timestamp_granularities[]", it.wireName) }
-                    request.extraFields.forEach { (key, value) -> append(key, value) }
+                    appendTranscriptionRequest(request)
                 }
             val body = response.bodyAsText()
             if (!response.status.isSuccess()) {
@@ -966,6 +1261,49 @@ class KtorOpenAIApi(
             }
             decodeTranscriptionResult(url, body, request.responseFormat)
         }
+
+    override fun streamTranscription(request: TranscriptionRequest): Flow<TranscriptionStreamEvent> = flow {
+        provider.requireAudioApiSupport()
+        requireKnownOpenAiTranscriptionCompatibility(provider, request, streaming = true)
+        require(request.stream != false) {
+            "streamTranscription requires stream to be unset or true"
+        }
+        val url = transcriptionUrl()
+        val statement =
+            try {
+                httpClient.preparePost(url) {
+                    expectSuccess = false
+                    header(HttpHeaders.Accept, ContentType.Text.EventStream.toString())
+                    applyEtiquette(config.etiquette)
+                    applyTimeouts(effectiveStreamingTimeouts)
+                    provider.applyRequest(config.apiKey, this)
+                    setBody(
+                        MultiPartFormDataContent(
+                            formData {
+                                appendTranscriptionRequest(request, forceStream = true)
+                            },
+                        ),
+                    )
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                if (t is OpenAIApiError) throw t
+                throw OpenAIApiError.Network(url, t)
+            }
+
+        statement.execute { response ->
+            observeResponseMetadata(url, response)
+            if (!response.status.isSuccess()) {
+                throw decodeErrorResponse(url, response)
+            }
+            throwUnexpectedSuccessfulNonStreamResponse(url, response, "streaming audio transcription")
+            wrapStreamingTransport(url) {
+                collectServerSentEvents(response.bodyAsChannel()) { sse ->
+                    emit(parseTranscriptionStreamEvent(sse))
+                }
+            }
+        }
+    }
 
     override suspend fun createTranslation(request: TranslationRequest): TranslationResult =
         withNonIdempotentRetry {
@@ -1221,6 +1559,30 @@ class KtorOpenAIApi(
             decodeJsonBody(url, body)
         }
 
+    override suspend fun getVectorStoreFile(vectorStoreId: VectorStoreId, fileId: FileId): VectorStoreFileObject =
+        withRetry {
+            provider.requireVectorStoresApiSupport()
+            val url = "${vectorStoresUrl()}/${vectorStoreId.value}/files/${fileId.value}"
+            val response = getRequest(url, configureRequest = { applyVectorStoresBeta() })
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun getVectorStoreFileContent(vectorStoreId: VectorStoreId, fileId: FileId): VectorStoreFileContentPage =
+        withRetry {
+            provider.requireVectorStoresApiSupport()
+            val url = "${vectorStoresUrl()}/${vectorStoreId.value}/files/${fileId.value}/content"
+            val response = getRequest(url, configureRequest = { applyVectorStoresBeta() })
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
     override suspend fun listVectorStoreFiles(
         vectorStoreId: VectorStoreId,
         query: VectorStoreFileListQuery,
@@ -1236,6 +1598,37 @@ class KtorOpenAIApi(
                     },
                     configureRequest = { applyVectorStoresBeta() },
                 )
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun updateVectorStoreFile(
+        vectorStoreId: VectorStoreId,
+        fileId: FileId,
+        request: VectorStoreFileUpdateRequest,
+    ): VectorStoreFileObject =
+        withNonIdempotentRetry {
+            provider.requireVectorStoresApiSupport()
+            val url = "${vectorStoresUrl()}/${vectorStoreId.value}/files/${fileId.value}"
+            val response =
+                postJson(url, request.toJson(), accept = ContentType.Application.Json.toString()) {
+                    applyVectorStoresBeta()
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun deleteVectorStoreFile(vectorStoreId: VectorStoreId, fileId: FileId): DeletedObject =
+        withRetry {
+            provider.requireVectorStoresApiSupport()
+            val url = "${vectorStoresUrl()}/${vectorStoreId.value}/files/${fileId.value}"
+            val response = deleteRequest(url) { applyVectorStoresBeta() }
             val body = response.bodyAsText()
             if (!response.status.isSuccess()) {
                 throw decodeError(url, response.status.value, body, response.headers)
@@ -1311,11 +1704,76 @@ class KtorOpenAIApi(
             decodeJsonBody(url, body)
         }
 
+    override suspend fun listVectorStoreFileBatchFiles(
+        vectorStoreId: VectorStoreId,
+        batchId: VectorStoreFileBatchId,
+        query: VectorStoreFileBatchListQuery,
+    ): VectorStoreFilePage =
+        withRetry {
+            provider.requireVectorStoresApiSupport()
+            val url = "${vectorStoresUrl()}/${vectorStoreId.value}/file_batches/${batchId.value}/files"
+            val response =
+                getRequest(
+                    url,
+                    extraParameters = {
+                        query.toParameters().forEach { (key, value) -> parameter(key, value) }
+                    },
+                    configureRequest = { applyVectorStoresBeta() },
+                )
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun createConversation(request: ConversationCreateRequest): ConversationObject =
+        withNonIdempotentRetry {
+            provider.requireConversationsApiSupport()
+            val url = conversationsUrl()
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun updateConversation(conversationId: ConversationId, request: ConversationUpdateRequest): ConversationObject =
+        withNonIdempotentRetry {
+            provider.requireConversationsApiSupport()
+            val url = "${conversationsUrl()}/${conversationId.value}"
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
     override suspend fun getConversation(conversationId: ConversationId): ConversationObject =
         withRetry {
             provider.requireConversationsApiSupport()
             val url = "${conversationsUrl()}/${conversationId.value}"
             val response = getRequest(url)
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun createConversationItems(
+        conversationId: ConversationId,
+        request: ConversationItemCreateRequest,
+    ): ConversationItemPage =
+        withNonIdempotentRetry {
+            provider.requireConversationsApiSupport()
+            val url = "${conversationsUrl()}/${conversationId.value}/items"
+            val response =
+                postJson(url, request.toJson(), accept = ContentType.Application.Json.toString()) {
+                    request.toParameters().forEach { (key, value) -> parameter(key, value) }
+                }
             val body = response.bodyAsText()
             if (!response.status.isSuccess()) {
                 throw decodeError(url, response.status.value, body, response.headers)
@@ -1404,14 +1862,62 @@ class KtorOpenAIApi(
         }
 
     override suspend fun createRealtimeClientSecret(
-        session: RealtimeSessionCreateRequest,
+        session: RealtimeSessionConfig,
         expiresAfter: RealtimeClientSecretExpiration?,
-    ): RealtimeClientSecretResponse = createRealtimeClientSecretInternal(session.toClientSecretSessionJson(), expiresAfter)
+    ): RealtimeClientSecretResponse = createRealtimeClientSecretInternal(session.toJson(), expiresAfter)
 
     override suspend fun createRealtimeClientSecret(
-        session: RealtimeTranscriptionSessionCreateRequest,
+        session: RealtimeTranscriptionSessionConfig,
         expiresAfter: RealtimeClientSecretExpiration?,
-    ): RealtimeClientSecretResponse = createRealtimeClientSecretInternal(session.toClientSecretSessionJson(), expiresAfter)
+    ): RealtimeClientSecretResponse = createRealtimeClientSecretInternal(session.toJson(), expiresAfter)
+
+    override suspend fun acceptRealtimeCall(callId: RealtimeCallId, request: RealtimeCallAcceptRequest) {
+        withNonIdempotentRetry {
+            provider.requireOpenAiOnly("realtime call control")
+            val url = realtimeCallUrl(callId, "accept")
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+        }
+    }
+
+    override suspend fun hangupRealtimeCall(callId: RealtimeCallId) {
+        withNonIdempotentRetry {
+            provider.requireOpenAiOnly("realtime call control")
+            val url = realtimeCallUrl(callId, "hangup")
+            val response = postJson(url, payload = null, accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+        }
+    }
+
+    override suspend fun referRealtimeCall(callId: RealtimeCallId, request: RealtimeCallReferRequest) {
+        withNonIdempotentRetry {
+            provider.requireOpenAiOnly("realtime call control")
+            val url = realtimeCallUrl(callId, "refer")
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+        }
+    }
+
+    override suspend fun rejectRealtimeCall(callId: RealtimeCallId, request: RealtimeCallRejectRequest) {
+        withNonIdempotentRetry {
+            provider.requireOpenAiOnly("realtime call control")
+            val url = realtimeCallUrl(callId, "reject")
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+        }
+    }
 
     override suspend fun createEval(request: EvalCreateRequest): EvalObject =
         withNonIdempotentRetry {
@@ -1539,6 +2045,34 @@ class KtorOpenAIApi(
             decodeJsonBody(url, body)
         }
 
+    override suspend fun cancelEvalRun(evalId: EvalId, runId: EvalRunId): EvalRunObject =
+        withNonIdempotentRetry {
+            provider.requireEvalsApiSupport()
+            val url = "${evalsUrl()}/${evalId.value}/runs/${runId.value}/cancel"
+            val response = postJson(url, buildJsonObject { }, accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun getEvalRunOutputItem(
+        evalId: EvalId,
+        runId: EvalRunId,
+        outputItemId: EvalRunOutputItemId,
+    ): EvalRunOutputItemObject =
+        withRetry {
+            provider.requireEvalsApiSupport()
+            val url = "${evalsUrl()}/${evalId.value}/runs/${runId.value}/output_items/${outputItemId.value}"
+            val response = getRequest(url)
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
     override suspend fun listEvalRunOutputItems(
         evalId: EvalId,
         runId: EvalRunId,
@@ -1562,6 +2096,58 @@ class KtorOpenAIApi(
         withNonIdempotentRetry {
             provider.requireVideosApiSupport()
             val url = videosUrl()
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun createVideoCharacter(request: VideoCharacterCreateRequest): VideoCharacterObject =
+        withNonIdempotentRetry {
+            provider.requireVideosApiSupport()
+            val url = videoCharactersUrl()
+            val response =
+                postMultipart(url, accept = ContentType.Application.Json.toString()) {
+                    append("name", request.name)
+                    appendBinaryUpload("video", request.video)
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun getVideoCharacter(characterId: VideoCharacterId): VideoCharacterObject =
+        withRetry {
+            provider.requireVideosApiSupport()
+            val url = "${videoCharactersUrl()}/${characterId.value}"
+            val response = getRequest(url)
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun editVideo(request: VideoEditRequest): VideoObject =
+        withNonIdempotentRetry {
+            provider.requireVideosApiSupport()
+            val url = videoEditsUrl()
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun extendVideo(request: VideoExtendRequest): VideoObject =
+        withNonIdempotentRetry {
+            provider.requireVideosApiSupport()
+            val url = videoExtensionsUrl()
             val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
             val body = response.bodyAsText()
             if (!response.status.isSuccess()) {
@@ -1808,6 +2394,10 @@ class KtorOpenAIApi(
     private fun moderationsUrl(): String = apiBaseUrl() + "/moderations"
     private fun batchesUrl(): String = apiBaseUrl() + "/batches"
     private fun fineTuningJobsUrl(): String = apiBaseUrl() + "/fine_tuning/jobs"
+    private fun fineTuningCheckpointPermissionsUrl(checkpointId: FineTunedModelCheckpointId): String =
+        apiBaseUrl() + "/fine_tuning/checkpoints/${checkpointId.value}/permissions"
+    private fun fineTuningGradersRunUrl(): String = apiBaseUrl() + "/fine_tuning/alpha/graders/run"
+    private fun fineTuningGradersValidateUrl(): String = apiBaseUrl() + "/fine_tuning/alpha/graders/validate"
     private fun chatCompletionsUrl(): String = apiBaseUrl() + "/chat/completions"
     private fun chatCompletionsUrl(request: ChatCompletionRequest): String {
         val azure = config.provider as? OpenAIProvider.Azure
@@ -1824,6 +2414,8 @@ class KtorOpenAIApi(
         }
     }
     private fun speechUrl(): String = apiBaseUrl() + "/audio/speech"
+    private fun audioVoicesUrl(): String = apiBaseUrl() + "/audio/voices"
+    private fun audioVoiceConsentsUrl(): String = apiBaseUrl() + "/audio/voice_consents"
     private fun transcriptionUrl(): String = apiBaseUrl() + "/audio/transcriptions"
     private fun translationUrl(): String = apiBaseUrl() + "/audio/translations"
     private fun filesUrl(): String = apiBaseUrl() + "/files"
@@ -1833,8 +2425,13 @@ class KtorOpenAIApi(
     private fun realtimeClientSecretsUrl(): String = apiBaseUrl() + "/realtime/client_secrets"
     private fun realtimeSessionsUrl(): String = apiBaseUrl() + "/realtime/sessions"
     private fun realtimeTranscriptionSessionsUrl(): String = apiBaseUrl() + "/realtime/transcription_sessions"
+    private fun realtimeCallUrl(callId: RealtimeCallId, action: String): String =
+        apiBaseUrl() + "/realtime/calls/${callId.value}/$action"
     private fun evalsUrl(): String = apiBaseUrl() + "/evals"
     private fun videosUrl(): String = apiBaseUrl() + "/videos"
+    private fun videoCharactersUrl(): String = videosUrl() + "/characters"
+    private fun videoEditsUrl(): String = videosUrl() + "/edits"
+    private fun videoExtensionsUrl(): String = videosUrl() + "/extensions"
     private fun xaiBatchesUrl(): String = apiBaseUrl() + "/batches"
     private fun xaiTtsUrl(): String = apiBaseUrl() + "/tts"
     private fun xaiVoicesUrl(): String = apiBaseUrl() + "/tts/voices"
@@ -2044,6 +2641,86 @@ class KtorOpenAIApi(
                 strategy.threshold?.let { append("chunking_strategy[threshold]", it.toString()) }
                 strategy.prefixPaddingMs?.let { append("chunking_strategy[prefix_padding_ms]", it.toString()) }
                 strategy.silenceDurationMs?.let { append("chunking_strategy[silence_duration_ms]", it.toString()) }
+            }
+        }
+    }
+
+    private fun FormBuilder.appendTranscriptionRequest(
+        request: TranscriptionRequest,
+        forceStream: Boolean? = null,
+    ) {
+        appendBinaryUpload("file", request.file)
+        append("model", request.model.value)
+        request.chunkingStrategy?.let { appendChunkingStrategy(it) }
+        request.knownSpeakerNames.forEach { append("known_speaker_names[]", it) }
+        request.knownSpeakerReferences.forEach { append("known_speaker_references[]", it) }
+        request.language?.let { append("language", it) }
+        request.prompt?.let { append("prompt", it) }
+        request.responseFormat?.let { append("response_format", it.wireName) }
+        (forceStream ?: request.stream)?.let { append("stream", it.toString()) }
+        request.temperature?.let { append("temperature", it.toString()) }
+        request.include.forEach { append("include[]", it.wireName) }
+        request.timestampGranularities.forEach { append("timestamp_granularities[]", it.wireName) }
+        request.extraFields.forEach { (key, value) -> append(key, value) }
+    }
+
+    private fun requireKnownOpenAiTranscriptionCompatibility(
+        provider: OpenAIProvider,
+        request: TranscriptionRequest,
+        streaming: Boolean = false,
+    ) {
+        if (provider !is OpenAIProvider.OpenAI) return
+
+        val model = request.model.value
+        val isRealtimeTranscribeModel =
+            model == "gpt-4o-transcribe" ||
+                model == "gpt-4o-mini-transcribe" ||
+                model == "gpt-4o-mini-transcribe-2025-12-15"
+
+        if (streaming) {
+            require(model != "whisper-1") {
+                "whisper-1 ignores stream=true on OpenAI; streamTranscription is not supported for whisper-1"
+            }
+        }
+
+        if (isRealtimeTranscribeModel) {
+            require(request.responseFormat == null || request.responseFormat == AudioTextResponseFormat.JSON) {
+                "$model only supports response_format=json on OpenAI"
+            }
+        }
+
+        if (request.include.contains(AudioTranscriptionInclude.LOGPROBS)) {
+            require(request.responseFormat == null || request.responseFormat == AudioTextResponseFormat.JSON) {
+                "include=logprobs requires response_format=json on OpenAI"
+            }
+            require(isRealtimeTranscribeModel) {
+                "include=logprobs is only supported for gpt-4o-transcribe and gpt-4o-mini-transcribe models on OpenAI"
+            }
+        }
+
+        if (request.timestampGranularities.isNotEmpty()) {
+            require(request.responseFormat == AudioTextResponseFormat.VERBOSE_JSON) {
+                "timestamp_granularities requires response_format=verbose_json on OpenAI"
+            }
+        }
+
+        if (model == "gpt-4o-transcribe-diarize") {
+            require(
+                request.responseFormat == null ||
+                    request.responseFormat == AudioTextResponseFormat.JSON ||
+                    request.responseFormat == AudioTextResponseFormat.TEXT ||
+                    request.responseFormat == AudioTextResponseFormat.DIARIZED_JSON,
+            ) {
+                "gpt-4o-transcribe-diarize only supports json, text, or diarized_json response formats on OpenAI"
+            }
+            require(request.prompt == null) {
+                "gpt-4o-transcribe-diarize does not support prompt on OpenAI"
+            }
+            require(request.include.isEmpty()) {
+                "gpt-4o-transcribe-diarize does not support include on OpenAI"
+            }
+            require(request.timestampGranularities.isEmpty()) {
+                "gpt-4o-transcribe-diarize does not support timestamp_granularities on OpenAI"
             }
         }
     }
@@ -2260,7 +2937,10 @@ class KtorOpenAIApi(
         while (!channel.isClosedForRead) {
             val read = channel.readAvailable(buffer, 0, buffer.size)
             if (read < 0) break
-            if (read == 0) continue
+            if (read == 0) {
+                yield()
+                continue
+            }
             emit(buffer.copyOf(read))
         }
     }
