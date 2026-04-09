@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Wabbit-Public-Test-License
+
 package one.wabbit.web.openai
 
 import io.ktor.client.HttpClient
@@ -11,7 +13,7 @@ import kotlin.test.assertTrue
 class OpenAILiveSmokeTest {
     @Test
     fun `live embeddings models and moderations smoke`() = runTest {
-        val config = loadLiveOpenAiConfigOrNull() ?: return@runTest
+        val config = requireLiveConfig(loadLiveOpenAiConfigOrNull(), "Live OpenAI config required")
         val client =
             HttpClient(CIO) {
                 install(HttpTimeout)

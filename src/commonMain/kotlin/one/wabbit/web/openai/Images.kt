@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package one.wabbit.web.openai
 
 import kotlinx.serialization.SerialName
@@ -408,6 +410,11 @@ data class ImageVariationRequest(
         require(n == null || n in 1..10) { "image variation n must be between 1 and 10 when set" }
         require(user == null || user.isNotBlank()) { "image variation user must not be blank when set" }
         require(extraFields.keys.all { it.isNotBlank() }) { "image variation extra field names must not be blank" }
+        requireNoExtraFieldCollisions(
+            owner = "image variation",
+            extraFields = extraFields,
+            reservedFieldNames = setOf("image", "model", "n", "response_format", "size", "user"),
+        )
     }
 }
 

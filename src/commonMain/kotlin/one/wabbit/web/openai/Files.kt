@@ -1,8 +1,34 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package one.wabbit.web.openai
 
+import io.ktor.utils.io.ByteReadChannel
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
+
+private fun validateUploadMetadata(
+    owner: String,
+    filename: String,
+    contentType: String?,
+) {
+    require(filename.isNotBlank()) { "$owner filename must not be blank" }
+    require(contentType == null || contentType.isNotBlank()) {
+        "$owner contentType must not be blank when set"
+    }
+}
+
+private fun validateFileExtraFields(
+    owner: String,
+    extraFields: Map<String, String>,
+) {
+    require(extraFields.keys.all { it.isNotBlank() }) { "$owner extra field names must not be blank" }
+    requireNoExtraFieldCollisions(
+        owner = owner,
+        extraFields = extraFields,
+        reservedFieldNames = setOf("purpose", "file"),
+    )
+}
 
 data class BinaryUpload(
     val filename: String,
@@ -10,9 +36,20 @@ data class BinaryUpload(
     val contentType: String? = null,
 ) {
     init {
-        require(filename.isNotBlank()) { "binary upload filename must not be blank" }
-        require(contentType == null || contentType.isNotBlank()) {
-            "binary upload contentType must not be blank when set"
+        validateUploadMetadata("binary upload", filename, contentType)
+    }
+}
+
+data class StreamingBinaryUpload(
+    val filename: String,
+    val sizeBytes: Long? = null,
+    val contentType: String? = null,
+    val openChannel: () -> ByteReadChannel,
+) {
+    init {
+        validateUploadMetadata("streaming binary upload", filename, contentType)
+        require(sizeBytes == null || sizeBytes >= 0) {
+            "streaming binary upload sizeBytes must be non-negative when set"
         }
     }
 }
@@ -23,7 +60,17 @@ data class FileCreateRequest(
     val extraFields: Map<String, String> = emptyMap(),
 ) {
     init {
-        require(extraFields.keys.all { it.isNotBlank() }) { "file extra field names must not be blank" }
+        validateFileExtraFields("file", extraFields)
+    }
+}
+
+data class StreamingFileCreateRequest(
+    val purpose: FilePurpose,
+    val file: StreamingBinaryUpload,
+    val extraFields: Map<String, String> = emptyMap(),
+) {
+    init {
+        validateFileExtraFields("streaming file", extraFields)
     }
 }
 

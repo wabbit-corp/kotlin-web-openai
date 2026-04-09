@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 @file:OptIn(kotlin.time.ExperimentalTime::class)
 
 package one.wabbit.web.openai
@@ -16,6 +18,7 @@ import io.ktor.client.request.post
 import io.ktor.client.request.prepareGet
 import io.ktor.client.request.preparePost
 import io.ktor.client.request.setBody
+import io.ktor.client.request.forms.ChannelProvider
 import io.ktor.client.request.forms.FormBuilder
 import io.ktor.client.request.forms.MultiPartFormDataContent
 import io.ktor.client.request.forms.formData
@@ -46,6 +49,7 @@ import one.wabbit.web.common.Schedule
 import one.wabbit.web.common.Timeouts
 import one.wabbit.web.common.applyEtiquette
 import one.wabbit.web.common.applyTimeouts
+import one.wabbit.web.common.forStreaming
 import one.wabbit.web.common.parseRetryAfterHeader
 import one.wabbit.web.common.runWithRetry
 import kotlin.coroutines.cancellation.CancellationException
@@ -53,10 +57,15 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
+internal val DefaultStreamingSocketTimeout: Duration = 60.seconds
+
 internal fun deriveStreamingTimeouts(
     timeouts: Timeouts,
     streamingTimeouts: Timeouts?,
-): Timeouts = streamingTimeouts ?: timeouts.copy(request = null, socket = null)
+): Timeouts {
+    if (streamingTimeouts != null) return streamingTimeouts
+    return timeouts.forStreaming(DefaultStreamingSocketTimeout)
+}
 
 interface OpenAIApi {
     data class Config(
@@ -69,9 +78,14 @@ interface OpenAIApi {
         val retryPolicy: OpenAIRetryPolicy? = defaultRetryPolicy(),
         val retryNonIdempotentRequests: Boolean = false,
         val onResponseMetadata: ((OpenAIResponseMetadata) -> Unit)? = null,
+        val includeBodySamplesInExceptions: Boolean = false,
+        val maxEagerBinaryBytes: Long? = 32L * 1024L * 1024L,
     ) {
         init {
             require(baseUrl.isNotBlank()) { "baseUrl must not be blank" }
+            require(maxEagerBinaryBytes == null || maxEagerBinaryBytes > 0) {
+                "maxEagerBinaryBytes must be positive when set"
+            }
         }
     }
 
@@ -137,27 +151,39 @@ interface OpenAIApi {
     suspend fun getStoredChatCompletion(completionId: ChatCompletionId): ChatCompletionResponse
     suspend fun listStoredChatCompletions(query: StoredChatCompletionListQuery = StoredChatCompletionListQuery()): StoredChatCompletionPage
     suspend fun listStoredChatCompletionMessages(completionId: ChatCompletionId): StoredChatMessagePage
+    suspend fun updateStoredChatCompletion(
+        completionId: ChatCompletionId,
+        request: StoredChatCompletionUpdateRequest,
+    ): ChatCompletionResponse
     suspend fun deleteStoredChatCompletion(completionId: ChatCompletionId): DeletedObject
     fun streamChatCompletion(request: ChatCompletionRequest): Flow<ChatCompletionStreamEvent>
     suspend fun createDeepSeekFimCompletion(request: DeepSeekFimCompletionRequest): DeepSeekFimCompletionResponse
     suspend fun createSpeech(request: SpeechRequest): ByteArray
     fun streamSpeech(request: SpeechRequest): Flow<SpeechStreamEvent>
     suspend fun createVoice(request: VoiceCreateRequest): AudioVoiceObject
+    suspend fun createVoice(request: StreamingVoiceCreateRequest): AudioVoiceObject
     suspend fun createVoiceConsent(request: VoiceConsentCreateRequest): VoiceConsentObject
+    suspend fun createVoiceConsent(request: StreamingVoiceConsentCreateRequest): VoiceConsentObject
     suspend fun getVoiceConsent(consentId: String): VoiceConsentObject
     suspend fun updateVoiceConsent(consentId: String, request: VoiceConsentUpdateRequest): VoiceConsentObject
     suspend fun deleteVoiceConsent(consentId: String): DeletedObject
     suspend fun listVoiceConsents(query: VoiceConsentListQuery = VoiceConsentListQuery()): VoiceConsentPage
     suspend fun createTranscription(request: TranscriptionRequest): TranscriptionResult
+    suspend fun createTranscription(request: StreamingTranscriptionRequest): TranscriptionResult
     fun streamTranscription(request: TranscriptionRequest): Flow<TranscriptionStreamEvent>
+    fun streamTranscription(request: StreamingTranscriptionRequest): Flow<TranscriptionStreamEvent>
     suspend fun createTranslation(request: TranslationRequest): TranslationResult
+    suspend fun createTranslation(request: StreamingTranslationRequest): TranslationResult
     suspend fun uploadFile(request: FileCreateRequest): OpenAIFile
+    suspend fun uploadFile(request: StreamingFileCreateRequest): OpenAIFile
     suspend fun getFile(fileId: FileId): OpenAIFile
     suspend fun listFiles(query: FileListQuery = FileListQuery()): FilePage
     suspend fun deleteFile(fileId: FileId): DeletedObject
     suspend fun downloadFile(fileId: FileId): ByteArray
+    suspend fun downloadFileTo(fileId: FileId, emit: suspend (ByteArray) -> Unit)
     suspend fun createUpload(request: UploadCreateRequest): UploadObject
     suspend fun addUploadPart(uploadId: UploadId, file: BinaryUpload): UploadPart
+    suspend fun addUploadPart(uploadId: UploadId, file: StreamingBinaryUpload): UploadPart
     suspend fun completeUpload(uploadId: UploadId, partIds: List<UploadPartId>): UploadObject
     suspend fun cancelUpload(uploadId: UploadId): UploadObject
     suspend fun createVectorStore(request: VectorStoreCreateRequest): VectorStoreObject
@@ -245,6 +271,7 @@ interface OpenAIApi {
     ): EvalRunOutputItemPage
     suspend fun createVideo(request: VideoCreateRequest): VideoObject
     suspend fun createVideoCharacter(request: VideoCharacterCreateRequest): VideoCharacterObject
+    suspend fun createVideoCharacter(request: StreamingVideoCharacterCreateRequest): VideoCharacterObject
     suspend fun getVideoCharacter(characterId: VideoCharacterId): VideoCharacterObject
     suspend fun editVideo(request: VideoEditRequest): VideoObject
     suspend fun extendVideo(request: VideoExtendRequest): VideoObject
@@ -252,7 +279,15 @@ interface OpenAIApi {
     suspend fun listVideos(query: VideoListQuery = VideoListQuery()): VideoPage
     suspend fun getVideo(videoId: VideoId): VideoObject
     suspend fun deleteVideo(videoId: VideoId): DeletedObject
-    suspend fun downloadVideoContent(videoId: VideoId): ByteArray
+    suspend fun downloadVideoContent(
+        videoId: VideoId,
+        variant: VideoContentVariant? = null,
+    ): ByteArray
+    suspend fun downloadVideoContentTo(
+        videoId: VideoId,
+        variant: VideoContentVariant? = null,
+        emit: suspend (ByteArray) -> Unit,
+    )
     suspend fun createXaiBatch(request: XAIBatchCreateRequest): XAIBatchObject
     suspend fun addXaiBatchRequests(batchId: XAIBatchId, requests: List<XAIBatchRequestInput>): XAIBatchRequestPage
     suspend fun getXaiBatch(batchId: XAIBatchId): XAIBatchObject
@@ -311,6 +346,32 @@ class KtorOpenAIApi(
     private val effectiveStreamingTimeouts: Timeouts
         get() = deriveStreamingTimeouts(config.timeouts, config.streamingTimeouts)
 
+    private fun parseError(
+        url: String,
+        cause: Throwable,
+        bodySample: String? = null,
+    ): OpenAIApiError.Parse =
+        OpenAIApiError.Parse(
+            url = url,
+            cause = cause,
+            bodySample = sanitizeExceptionBodySample(bodySample),
+            includeBodySampleInMessage = config.includeBodySamplesInExceptions,
+        )
+
+    private fun httpError(
+        url: String,
+        status: Int,
+        bodySample: String?,
+        retryAfterSeconds: Double? = null,
+    ): OpenAIApiError.Http =
+        OpenAIApiError.Http(
+            url = url,
+            status = status,
+            bodySample = sanitizeExceptionBodySample(bodySample),
+            retryAfterSeconds = retryAfterSeconds,
+            includeBodySampleInMessage = config.includeBodySamplesInExceptions,
+        )
+
     override suspend fun createResponse(request: ResponseCreateRequest): ResponseObject =
         withNonIdempotentRetry {
             request.requireCompatibleWith(provider)
@@ -327,7 +388,7 @@ class KtorOpenAIApi(
             try {
                 OpenAIJson.decodeFromString<ResponseObject>(body)
             } catch (t: Throwable) {
-                throw OpenAIApiError.Parse(url, t, bodySample = body.take(2048))
+                throw parseError(url, t, bodySample = body.take(2048))
             }
         }
 
@@ -367,7 +428,7 @@ class KtorOpenAIApi(
                         try {
                             parseResponseStreamEvent(sse)
                         } catch (t: Throwable) {
-                            throw OpenAIApiError.Parse(url, t, bodySample = sse.data.value.take(2048))
+                            throw parseError(url, t, bodySample = sse.data.value.take(2048))
                         }
                     emit(event)
                 }
@@ -410,7 +471,7 @@ class KtorOpenAIApi(
                         try {
                             parseResponseStreamEvent(sse)
                         } catch (t: Throwable) {
-                            throw OpenAIApiError.Parse(url, t, bodySample = sse.data.value.take(2048))
+                            throw parseError(url, t, bodySample = sse.data.value.take(2048))
                         }
                     emit(event)
                 }
@@ -436,7 +497,7 @@ class KtorOpenAIApi(
             try {
                 OpenAIJson.decodeFromString<ResponseObject>(body)
             } catch (t: Throwable) {
-                throw OpenAIApiError.Parse(url, t, bodySample = body.take(2048))
+                throw parseError(url, t, bodySample = body.take(2048))
             }
         }
 
@@ -477,7 +538,7 @@ class KtorOpenAIApi(
             try {
                 OpenAIJson.decodeFromString<ResponseObject>(body)
             } catch (t: Throwable) {
-                throw OpenAIApiError.Parse(url, t, bodySample = body.take(2048))
+                throw parseError(url, t, bodySample = body.take(2048))
             }
         }
 
@@ -496,7 +557,7 @@ class KtorOpenAIApi(
             try {
                 OpenAIJson.decodeFromString<ResponsePage>(body)
             } catch (t: Throwable) {
-                throw OpenAIApiError.Parse(url, t, bodySample = body.take(2048))
+                throw parseError(url, t, bodySample = body.take(2048))
             }
         }
 
@@ -518,7 +579,7 @@ class KtorOpenAIApi(
             try {
                 OpenAIJson.decodeFromString<ResponseInputItemPage>(body)
             } catch (t: Throwable) {
-                throw OpenAIApiError.Parse(url, t, bodySample = body.take(2048))
+                throw parseError(url, t, bodySample = body.take(2048))
             }
         }
 
@@ -666,7 +727,7 @@ class KtorOpenAIApi(
                         try {
                             parseImageStreamEvent(sse)
                         } catch (t: Throwable) {
-                            throw OpenAIApiError.Parse(url, t, bodySample = sse.data.value.take(2048))
+                            throw parseError(url, t, bodySample = sse.data.value.take(2048))
                         }
                     emit(event)
                 }
@@ -707,7 +768,7 @@ class KtorOpenAIApi(
                         try {
                             parseImageStreamEvent(sse)
                         } catch (t: Throwable) {
-                            throw OpenAIApiError.Parse(url, t, bodySample = sse.data.value.take(2048))
+                            throw parseError(url, t, bodySample = sse.data.value.take(2048))
                         }
                     emit(event)
                 }
@@ -973,7 +1034,7 @@ class KtorOpenAIApi(
             try {
                 OpenAIJson.decodeFromString<ChatCompletionResponse>(body)
             } catch (t: Throwable) {
-                throw OpenAIApiError.Parse(url, t, bodySample = body.take(2048))
+                throw parseError(url, t, bodySample = body.take(2048))
             }
         }
 
@@ -1009,6 +1070,21 @@ class KtorOpenAIApi(
             provider.requireStoredChatCompletionsApiSupport()
             val url = "${chatCompletionsUrl()}/${completionId.value}/messages"
             val response = getRequest(url)
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun updateStoredChatCompletion(
+        completionId: ChatCompletionId,
+        request: StoredChatCompletionUpdateRequest,
+    ): ChatCompletionResponse =
+        withNonIdempotentRetry {
+            provider.requireStoredChatCompletionsApiSupport()
+            val url = "${chatCompletionsUrl()}/${completionId.value}"
+            val response = postJson(url, request.toJson(), accept = ContentType.Application.Json.toString())
             val body = response.bodyAsText()
             if (!response.status.isSuccess()) {
                 throw decodeError(url, response.status.value, body, response.headers)
@@ -1060,7 +1136,7 @@ class KtorOpenAIApi(
                         try {
                             parseChatCompletionStreamEvent(sse)
                         } catch (t: Throwable) {
-                            throw OpenAIApiError.Parse(url, t, bodySample = sse.data.value.take(2048))
+                            throw parseError(url, t, bodySample = sse.data.value.take(2048))
                         }
                     emit(event)
                 }
@@ -1172,7 +1248,41 @@ class KtorOpenAIApi(
             decodeJsonBody(url, body)
         }
 
+    override suspend fun createVoice(request: StreamingVoiceCreateRequest): AudioVoiceObject =
+        withNonIdempotentRetry {
+            provider.requireOpenAiOnly("custom voices")
+            val url = audioVoicesUrl()
+            val response =
+                postMultipart(url, accept = ContentType.Application.Json.toString()) {
+                    append("name", request.name)
+                    append("consent", request.consentId)
+                    appendBinaryUpload("audio_sample", request.audioSample)
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
     override suspend fun createVoiceConsent(request: VoiceConsentCreateRequest): VoiceConsentObject =
+        withNonIdempotentRetry {
+            provider.requireOpenAiOnly("voice consents")
+            val url = audioVoiceConsentsUrl()
+            val response =
+                postMultipart(url, accept = ContentType.Application.Json.toString()) {
+                    append("name", request.name)
+                    append("language", request.language)
+                    appendBinaryUpload("recording", request.recording)
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun createVoiceConsent(request: StreamingVoiceConsentCreateRequest): VoiceConsentObject =
         withNonIdempotentRetry {
             provider.requireOpenAiOnly("voice consents")
             val url = audioVoiceConsentsUrl()
@@ -1262,12 +1372,75 @@ class KtorOpenAIApi(
             decodeTranscriptionResult(url, body, request.responseFormat)
         }
 
+    override suspend fun createTranscription(request: StreamingTranscriptionRequest): TranscriptionResult =
+        withNonIdempotentRetry {
+            provider.requireAudioApiSupport()
+            requireKnownOpenAiTranscriptionCompatibility(provider, request)
+            require(request.stream != true) {
+                "createTranscription does not support stream=true; use streamTranscription instead"
+            }
+            val url = transcriptionUrl()
+            val response =
+                postMultipart(url, accept = "*/*") {
+                    appendTranscriptionRequest(request)
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeTranscriptionResult(url, body, request.responseFormat)
+        }
+
     override fun streamTranscription(request: TranscriptionRequest): Flow<TranscriptionStreamEvent> = flow {
         provider.requireAudioApiSupport()
         requireKnownOpenAiTranscriptionCompatibility(provider, request, streaming = true)
         require(request.stream != false) {
             "streamTranscription requires stream to be unset or true"
         }
+        val url = transcriptionUrl()
+        val statement =
+            try {
+                httpClient.preparePost(url) {
+                    expectSuccess = false
+                    header(HttpHeaders.Accept, ContentType.Text.EventStream.toString())
+                    applyEtiquette(config.etiquette)
+                    applyTimeouts(effectiveStreamingTimeouts)
+                    provider.applyRequest(config.apiKey, this)
+                    setBody(
+                        MultiPartFormDataContent(
+                            formData {
+                                appendTranscriptionRequest(request, forceStream = true)
+                            },
+                        ),
+                    )
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                if (t is OpenAIApiError) throw t
+                throw OpenAIApiError.Network(url, t)
+            }
+
+        statement.execute { response ->
+            observeResponseMetadata(url, response)
+            if (!response.status.isSuccess()) {
+                throw decodeErrorResponse(url, response)
+            }
+            throwUnexpectedSuccessfulNonStreamResponse(url, response, "streaming audio transcription")
+            wrapStreamingTransport(url) {
+                collectServerSentEvents(response.bodyAsChannel()) { sse ->
+                    emit(parseTranscriptionStreamEvent(sse))
+                }
+            }
+        }
+    }
+
+    override fun streamTranscription(request: StreamingTranscriptionRequest): Flow<TranscriptionStreamEvent> = flow {
+        provider.requireAudioApiSupport()
+        requireKnownOpenAiTranscriptionCompatibility(provider, request, streaming = true)
+        require(request.stream != false) {
+            "streamTranscription requires stream to be unset or true"
+        }
+
         val url = transcriptionUrl()
         val statement =
             try {
@@ -1325,7 +1498,44 @@ class KtorOpenAIApi(
             decodeTranslationResult(url, body, request.responseFormat)
         }
 
+    override suspend fun createTranslation(request: StreamingTranslationRequest): TranslationResult =
+        withNonIdempotentRetry {
+            provider.requireAudioApiSupport()
+            val url = translationUrl()
+            val response =
+                postMultipart(url, accept = "*/*") {
+                    appendBinaryUpload("file", request.file)
+                    append("model", request.model.value)
+                    request.prompt?.let { append("prompt", it) }
+                    request.responseFormat?.let { append("response_format", it.wireName) }
+                    request.temperature?.let { append("temperature", it.toString()) }
+                    request.extraFields.forEach { (key, value) -> append(key, value) }
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeTranslationResult(url, body, request.responseFormat)
+        }
+
     override suspend fun uploadFile(request: FileCreateRequest): OpenAIFile =
+        withNonIdempotentRetry {
+            provider.requireFilesApiSupport()
+            val url = filesUrl()
+            val response =
+                postMultipart(url, accept = ContentType.Application.Json.toString()) {
+                    append("purpose", request.purpose.wireName)
+                    appendBinaryUpload("file", request.file)
+                    request.extraFields.forEach { (key, value) -> append(key, value) }
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun uploadFile(request: StreamingFileCreateRequest): OpenAIFile =
         withNonIdempotentRetry {
             provider.requireFilesApiSupport()
             val url = filesUrl()
@@ -1392,6 +1602,17 @@ class KtorOpenAIApi(
             readBinaryBody(url, response)
         }
 
+    override suspend fun downloadFileTo(fileId: FileId, emit: suspend (ByteArray) -> Unit) =
+        withRetry {
+            provider.requireFilesApiSupport()
+            val url = "${filesUrl()}/${fileId.value}/content"
+            val response = getRequest(url, accept = "*/*")
+            if (!response.status.isSuccess()) {
+                throw decodeErrorResponse(url, response)
+            }
+            streamBinaryBody(url, response, emit)
+        }
+
     override suspend fun createUpload(request: UploadCreateRequest): UploadObject =
         withNonIdempotentRetry {
             provider.requireUploadsApiSupport()
@@ -1405,6 +1626,21 @@ class KtorOpenAIApi(
         }
 
     override suspend fun addUploadPart(uploadId: UploadId, file: BinaryUpload): UploadPart =
+        withNonIdempotentRetry {
+            provider.requireUploadsApiSupport()
+            val url = "${uploadsUrl()}/${uploadId.value}/parts"
+            val response =
+                postMultipart(url, accept = ContentType.Application.Json.toString()) {
+                    appendBinaryUpload("data", file)
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun addUploadPart(uploadId: UploadId, file: StreamingBinaryUpload): UploadPart =
         withNonIdempotentRetry {
             provider.requireUploadsApiSupport()
             val url = "${uploadsUrl()}/${uploadId.value}/parts"
@@ -2048,8 +2284,8 @@ class KtorOpenAIApi(
     override suspend fun cancelEvalRun(evalId: EvalId, runId: EvalRunId): EvalRunObject =
         withNonIdempotentRetry {
             provider.requireEvalsApiSupport()
-            val url = "${evalsUrl()}/${evalId.value}/runs/${runId.value}/cancel"
-            val response = postJson(url, buildJsonObject { }, accept = ContentType.Application.Json.toString())
+            val url = "${evalsUrl()}/${evalId.value}/runs/${runId.value}"
+            val response = postJson(url, payload = null, accept = ContentType.Application.Json.toString())
             val body = response.bodyAsText()
             if (!response.status.isSuccess()) {
                 throw decodeError(url, response.status.value, body, response.headers)
@@ -2105,6 +2341,22 @@ class KtorOpenAIApi(
         }
 
     override suspend fun createVideoCharacter(request: VideoCharacterCreateRequest): VideoCharacterObject =
+        withNonIdempotentRetry {
+            provider.requireVideosApiSupport()
+            val url = videoCharactersUrl()
+            val response =
+                postMultipart(url, accept = ContentType.Application.Json.toString()) {
+                    append("name", request.name)
+                    appendBinaryUpload("video", request.video)
+                }
+            val body = response.bodyAsText()
+            if (!response.status.isSuccess()) {
+                throw decodeError(url, response.status.value, body, response.headers)
+            }
+            decodeJsonBody(url, body)
+        }
+
+    override suspend fun createVideoCharacter(request: StreamingVideoCharacterCreateRequest): VideoCharacterObject =
         withNonIdempotentRetry {
             provider.requireVideosApiSupport()
             val url = videoCharactersUrl()
@@ -2207,16 +2459,39 @@ class KtorOpenAIApi(
             decodeJsonBody(url, body)
         }
 
-    override suspend fun downloadVideoContent(videoId: VideoId): ByteArray =
+    override suspend fun downloadVideoContent(
+        videoId: VideoId,
+        variant: VideoContentVariant?,
+    ): ByteArray =
         withRetry {
             provider.requireVideosApiSupport()
             val url = "${videosUrl()}/${videoId.value}/content"
-            val response = getRequest(url, accept = "*/*")
+            val response =
+                getRequest(url, accept = "*/*") {
+                    variant?.let { parameter("variant", it.wireName) }
+                }
             if (!response.status.isSuccess()) {
                 throw decodeErrorResponse(url, response)
             }
             readBinaryBody(url, response)
         }
+
+    override suspend fun downloadVideoContentTo(
+        videoId: VideoId,
+        variant: VideoContentVariant?,
+        emit: suspend (ByteArray) -> Unit,
+    ) = withRetry {
+        provider.requireVideosApiSupport()
+        val url = "${videosUrl()}/${videoId.value}/content"
+        val response =
+            getRequest(url, accept = "*/*") {
+                variant?.let { parameter("variant", it.wireName) }
+            }
+        if (!response.status.isSuccess()) {
+            throw decodeErrorResponse(url, response)
+        }
+        streamBinaryBody(url, response, emit)
+    }
 
     override suspend fun createXaiBatch(request: XAIBatchCreateRequest): XAIBatchObject =
         withNonIdempotentRetry {
@@ -2501,7 +2776,7 @@ class KtorOpenAIApi(
             if (payload != null) {
                 setBody(payload.toString())
             } else {
-                setBody("")
+                setBody("{}")
             }
         }
             .also { observeResponseMetadata(url, it) }
@@ -2629,7 +2904,7 @@ class KtorOpenAIApi(
         return if (parsed != null) {
             OpenAIApiError.Api(url, status, parsed, retryAfterSeconds = retryAfterSeconds)
         } else {
-            OpenAIApiError.Http(url, status, body.take(2048), retryAfterSeconds = retryAfterSeconds)
+            httpError(url, status, body.take(2048), retryAfterSeconds = retryAfterSeconds)
         }
     }
 
@@ -2664,33 +2939,88 @@ class KtorOpenAIApi(
         request.extraFields.forEach { (key, value) -> append(key, value) }
     }
 
+    private fun FormBuilder.appendTranscriptionRequest(
+        request: StreamingTranscriptionRequest,
+        forceStream: Boolean? = null,
+    ) {
+        appendBinaryUpload("file", request.file)
+        append("model", request.model.value)
+        request.chunkingStrategy?.let { appendChunkingStrategy(it) }
+        request.knownSpeakerNames.forEach { append("known_speaker_names[]", it) }
+        request.knownSpeakerReferences.forEach { append("known_speaker_references[]", it) }
+        request.language?.let { append("language", it) }
+        request.prompt?.let { append("prompt", it) }
+        request.responseFormat?.let { append("response_format", it.wireName) }
+        (forceStream ?: request.stream)?.let { append("stream", it.toString()) }
+        request.temperature?.let { append("temperature", it.toString()) }
+        request.include.forEach { append("include[]", it.wireName) }
+        request.timestampGranularities.forEach { append("timestamp_granularities[]", it.wireName) }
+        request.extraFields.forEach { (key, value) -> append(key, value) }
+    }
+
     private fun requireKnownOpenAiTranscriptionCompatibility(
         provider: OpenAIProvider,
         request: TranscriptionRequest,
         streaming: Boolean = false,
     ) {
+        requireKnownOpenAiTranscriptionCompatibility(
+            provider = provider,
+            model = request.model,
+            responseFormat = request.responseFormat,
+            prompt = request.prompt,
+            include = request.include,
+            timestampGranularities = request.timestampGranularities,
+            streaming = streaming,
+        )
+    }
+
+    private fun requireKnownOpenAiTranscriptionCompatibility(
+        provider: OpenAIProvider,
+        request: StreamingTranscriptionRequest,
+        streaming: Boolean = false,
+    ) {
+        requireKnownOpenAiTranscriptionCompatibility(
+            provider = provider,
+            model = request.model,
+            responseFormat = request.responseFormat,
+            prompt = request.prompt,
+            include = request.include,
+            timestampGranularities = request.timestampGranularities,
+            streaming = streaming,
+        )
+    }
+
+    private fun requireKnownOpenAiTranscriptionCompatibility(
+        provider: OpenAIProvider,
+        model: ModelId,
+        responseFormat: AudioTextResponseFormat?,
+        prompt: String?,
+        include: List<AudioTranscriptionInclude>,
+        timestampGranularities: List<AudioTimestampGranularity>,
+        streaming: Boolean = false,
+    ) {
         if (provider !is OpenAIProvider.OpenAI) return
 
-        val model = request.model.value
+        val modelName = model.value
         val isRealtimeTranscribeModel =
-            model == "gpt-4o-transcribe" ||
-                model == "gpt-4o-mini-transcribe" ||
-                model == "gpt-4o-mini-transcribe-2025-12-15"
+            modelName == "gpt-4o-transcribe" ||
+                modelName == "gpt-4o-mini-transcribe" ||
+                modelName == "gpt-4o-mini-transcribe-2025-12-15"
 
         if (streaming) {
-            require(model != "whisper-1") {
+            require(modelName != "whisper-1") {
                 "whisper-1 ignores stream=true on OpenAI; streamTranscription is not supported for whisper-1"
             }
         }
 
         if (isRealtimeTranscribeModel) {
-            require(request.responseFormat == null || request.responseFormat == AudioTextResponseFormat.JSON) {
-                "$model only supports response_format=json on OpenAI"
+            require(responseFormat == null || responseFormat == AudioTextResponseFormat.JSON) {
+                "$modelName only supports response_format=json on OpenAI"
             }
         }
 
-        if (request.include.contains(AudioTranscriptionInclude.LOGPROBS)) {
-            require(request.responseFormat == null || request.responseFormat == AudioTextResponseFormat.JSON) {
+        if (include.contains(AudioTranscriptionInclude.LOGPROBS)) {
+            require(responseFormat == null || responseFormat == AudioTextResponseFormat.JSON) {
                 "include=logprobs requires response_format=json on OpenAI"
             }
             require(isRealtimeTranscribeModel) {
@@ -2698,28 +3028,28 @@ class KtorOpenAIApi(
             }
         }
 
-        if (request.timestampGranularities.isNotEmpty()) {
-            require(request.responseFormat == AudioTextResponseFormat.VERBOSE_JSON) {
+        if (timestampGranularities.isNotEmpty()) {
+            require(responseFormat == AudioTextResponseFormat.VERBOSE_JSON) {
                 "timestamp_granularities requires response_format=verbose_json on OpenAI"
             }
         }
 
-        if (model == "gpt-4o-transcribe-diarize") {
+        if (modelName == "gpt-4o-transcribe-diarize") {
             require(
-                request.responseFormat == null ||
-                    request.responseFormat == AudioTextResponseFormat.JSON ||
-                    request.responseFormat == AudioTextResponseFormat.TEXT ||
-                    request.responseFormat == AudioTextResponseFormat.DIARIZED_JSON,
+                responseFormat == null ||
+                    responseFormat == AudioTextResponseFormat.JSON ||
+                    responseFormat == AudioTextResponseFormat.TEXT ||
+                    responseFormat == AudioTextResponseFormat.DIARIZED_JSON,
             ) {
                 "gpt-4o-transcribe-diarize only supports json, text, or diarized_json response formats on OpenAI"
             }
-            require(request.prompt == null) {
+            require(prompt == null) {
                 "gpt-4o-transcribe-diarize does not support prompt on OpenAI"
             }
-            require(request.include.isEmpty()) {
+            require(include.isEmpty()) {
                 "gpt-4o-transcribe-diarize does not support include on OpenAI"
             }
-            require(request.timestampGranularities.isEmpty()) {
+            require(timestampGranularities.isEmpty()) {
                 "gpt-4o-transcribe-diarize does not support timestamp_granularities on OpenAI"
             }
         }
@@ -2755,11 +3085,10 @@ class KtorOpenAIApi(
             )
         }
 
-        throw OpenAIApiError.Parse(
-            url,
-            IllegalStateException(
-                "$operation expected text/event-stream but received $normalized with body sample: ${body.take(256)}",
-            ),
+        throw parseError(
+            url = url,
+            cause = IllegalStateException("$operation expected text/event-stream but received $normalized"),
+            bodySample = body.take(2048),
         )
     }
 
@@ -2788,11 +3117,10 @@ class KtorOpenAIApi(
             )
         }
 
-        throw OpenAIApiError.Parse(
-            url,
-            IllegalStateException(
-                "$operation expected audio bytes but received $normalized with body sample: ${body.take(256)}",
-            ),
+        throw parseError(
+            url = url,
+            cause = IllegalStateException("$operation expected audio bytes but received $normalized"),
+            bodySample = body.take(2048),
         )
     }
 
@@ -2817,18 +3145,64 @@ class KtorOpenAIApi(
         response: io.ktor.client.statement.HttpResponse,
     ): ByteArray =
         try {
-            response.body()
+            val maxBytes = config.maxEagerBinaryBytes
+            val declaredLength = response.headers[HttpHeaders.ContentLength]?.toLongOrNull()
+            if (maxBytes != null && declaredLength != null && declaredLength > maxBytes) {
+                throw IllegalStateException(
+                    "Binary body exceeds maxEagerBinaryBytes=$maxBytes bytes for eager download at $url (Content-Length=$declaredLength)",
+                )
+            }
+
+            val chunks = mutableListOf<ByteArray>()
+            var totalBytes = 0L
+            collectByteChunks(response.bodyAsChannel()) { chunk ->
+                totalBytes += chunk.size
+                if (maxBytes != null && totalBytes > maxBytes) {
+                    throw IllegalStateException(
+                        "Binary body exceeds maxEagerBinaryBytes=$maxBytes bytes for eager download at $url",
+                    )
+                }
+                chunks += chunk
+            }
+            concatenateByteChunks(chunks, totalBytes.toInt())
         } catch (t: Throwable) {
             if (t is CancellationException) throw t
             if (t is OpenAIApiError) throw t
+            if (t is IllegalStateException) throw t
             throw OpenAIApiError.Network(url, t)
         }
+
+    private suspend fun streamBinaryBody(
+        url: String,
+        response: io.ktor.client.statement.HttpResponse,
+        emit: suspend (ByteArray) -> Unit,
+    ) {
+        val channel =
+            try {
+                response.bodyAsChannel()
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                if (t is OpenAIApiError) throw t
+                throw OpenAIApiError.Network(url, t)
+            }
+        collectByteChunks(channel, emit)
+    }
+
+    private fun concatenateByteChunks(chunks: List<ByteArray>, totalBytes: Int): ByteArray {
+        val result = ByteArray(totalBytes)
+        var offset = 0
+        chunks.forEach { chunk ->
+            chunk.copyInto(result, destinationOffset = offset)
+            offset += chunk.size
+        }
+        return result
+    }
 
     private inline fun <reified T> decodeJsonBody(url: String, body: String): T =
         try {
             OpenAIJson.decodeFromString<T>(body)
         } catch (t: Throwable) {
-            throw OpenAIApiError.Parse(url, t, bodySample = body.take(2048))
+            throw parseError(url, t, bodySample = body.take(2048))
         }
 
     private fun decodeModelPage(url: String, body: String): ModelPage =
@@ -2850,7 +3224,7 @@ class KtorOpenAIApi(
                 }
             OpenAIJson.decodeFromJsonElement<ModelPage>(normalized)
         } catch (t: Throwable) {
-            throw OpenAIApiError.Parse(url, t, bodySample = body.take(2048))
+            throw parseError(url, t, bodySample = body.take(2048))
         }
 
     private fun decodeTranscriptionResult(
@@ -2906,7 +3280,7 @@ class KtorOpenAIApi(
                         if (requestedFormat == null) {
                             fallback(body, null)
                         } else {
-                            throw OpenAIApiError.Parse(url, it, bodySample = body.take(2048))
+                            throw parseError(url, it, bodySample = body.take(2048))
                         }
                     }
         }
@@ -2916,17 +3290,57 @@ class KtorOpenAIApi(
     }
 
     private fun FormBuilder.appendBinaryUpload(name: String, file: BinaryUpload) {
+        val safeFilename = sanitizeMultipartFilename(file.filename)
         append(
             name,
             file.bytes,
             Headers.build {
                 append(
                     HttpHeaders.ContentDisposition,
-                    """form-data; name="$name"; filename="${file.filename.replace("\"", "%22")}"""",
+                    """form-data; name="$name"; filename="$safeFilename"""",
                 )
                 file.contentType?.let { append(HttpHeaders.ContentType, it) }
             },
         )
+    }
+
+    private fun FormBuilder.appendBinaryUpload(name: String, file: StreamingBinaryUpload) {
+        val safeFilename = sanitizeMultipartFilename(file.filename)
+        append(
+            name,
+            ChannelProvider(file.sizeBytes) { file.openChannel() },
+            Headers.build {
+                append(
+                    HttpHeaders.ContentDisposition,
+                    """form-data; name="$name"; filename="$safeFilename"""",
+                )
+                file.contentType?.let { append(HttpHeaders.ContentType, it) }
+            },
+        )
+    }
+
+    private fun sanitizeMultipartFilename(filename: String): String {
+        val leafName = filename.replace('\\', '/').substringAfterLast('/')
+        val sanitized =
+            buildString(leafName.length) {
+                var lastWasReplacement = false
+                leafName.forEach { ch ->
+                    val safeChar =
+                        when {
+                            ch == '"' || ch == '\r' || ch == '\n' || ch.code < 0x20 || ch.code == 0x7f -> '_'
+                            else -> ch
+                        }
+                    if (safeChar == '_') {
+                        if (!lastWasReplacement) append(safeChar)
+                        lastWasReplacement = true
+                    } else {
+                        append(safeChar)
+                        lastWasReplacement = false
+                    }
+                }
+            }.trim()
+
+        return sanitized.ifBlank { "upload" }
     }
 
     private suspend fun collectByteChunks(

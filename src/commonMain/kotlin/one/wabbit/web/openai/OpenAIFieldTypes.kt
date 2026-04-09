@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package one.wabbit.web.openai
 
 import kotlin.jvm.JvmInline
@@ -270,6 +272,11 @@ sealed interface VideoStatus {
         override val wireName: String = "queued"
     }
 
+    data object InProgress : VideoStatus {
+        override val wireName: String = "in_progress"
+    }
+
+    @Deprecated("Legacy non-OpenAI status alias; prefer InProgress")
     data object Processing : VideoStatus {
         override val wireName: String = "processing"
     }
@@ -297,6 +304,7 @@ internal object VideoStatusSerializer :
         knownValues =
             listOf(
                 VideoStatus.Queued,
+                VideoStatus.InProgress,
                 VideoStatus.Processing,
                 VideoStatus.Completed,
                 VideoStatus.Failed,

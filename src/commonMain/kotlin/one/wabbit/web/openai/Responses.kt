@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package one.wabbit.web.openai
 
 import kotlinx.serialization.SerialName
@@ -97,8 +99,8 @@ sealed interface ResponseInputItem {
         val outputContent: List<ResponseInputContent>? = null,
     ) : ResponseInputItem {
         init {
-            require(outputText != null || outputContent != null) {
-                "function call output must provide outputText or outputContent"
+            require((outputText != null) != (outputContent != null)) {
+                "function call output must provide exactly one of outputText or outputContent"
             }
             require(outputText == null || outputText.isNotBlank()) {
                 "function call outputText must not be blank when set"
@@ -693,6 +695,23 @@ sealed interface ResponseToolChoice {
         override fun toJson(): JsonElement = JsonPrimitive("none")
     }
 
+    data class AllowedTools(
+        val mode: Mode,
+        val tools: List<ResponseTool>,
+    ) : ResponseToolChoice {
+        enum class Mode(val wireName: String) {
+            AUTO("auto"),
+            REQUIRED("required"),
+        }
+
+        init {
+            require(tools.isNotEmpty()) { "allowed_tools tool choice must include at least one tool" }
+        }
+
+        override fun toJson(): JsonElement =
+            error("allowed_tools tool choice is only supported on chat completions in this client")
+    }
+
     data object Shell : ResponseToolChoice {
         override fun toJson(): JsonElement =
             buildJsonObject {
@@ -771,6 +790,62 @@ sealed interface ResponseToolChoice {
         override fun toJson(): JsonElement = json
     }
 }
+
+internal fun OpenAIProvider.requireBuiltinToolCompatibility(
+    surface: String,
+    tools: List<ResponseTool>,
+    toolChoice: ResponseToolChoice?,
+) {
+    if (capabilities.builtinTools) return
+
+    val incompatibleTools =
+        buildList {
+            tools.mapNotNullTo(this) { it.typedBuiltinToolLabelOrNull() }
+            when (toolChoice) {
+                is ResponseToolChoice.AllowedTools -> toolChoice.tools.mapNotNullTo(this) { it.typedBuiltinToolLabelOrNull() }
+                else -> toolChoice?.typedBuiltinToolLabelOrNull()?.let(::add)
+            }
+        }.distinct()
+
+    require(incompatibleTools.isEmpty()) {
+        "$id does not expose typed built-in $surface tools in this client: ${incompatibleTools.joinToString(", ")}. Use function/custom tools or Raw for provider-specific escape hatches"
+    }
+}
+
+private fun ResponseTool.typedBuiltinToolLabelOrNull(): String? =
+    when (this) {
+        is ResponseTool.Function,
+        is ResponseTool.Custom,
+        is ResponseTool.Raw,
+        -> null
+        is ResponseTool.WebSearch -> toolType.wireName
+        is ResponseTool.FileSearch -> "file_search"
+        is ResponseTool.ImageGeneration -> "image_generation"
+        is ResponseTool.CodeInterpreter -> "code_interpreter"
+        ResponseTool.LocalShell -> "local_shell"
+        is ResponseTool.Shell -> "shell"
+        ResponseTool.ApplyPatch -> "apply_patch"
+        is ResponseTool.ComputerUse -> toolType.wireName
+        is ResponseTool.XSearch -> "x_search"
+        is ResponseTool.Hosted -> type
+        is ResponseTool.Mcp -> "mcp"
+    }
+
+private fun ResponseToolChoice.typedBuiltinToolLabelOrNull(): String? =
+    when (this) {
+        ResponseToolChoice.Auto,
+        ResponseToolChoice.Required,
+        ResponseToolChoice.None,
+        is ResponseToolChoice.NamedFunction,
+        is ResponseToolChoice.Custom,
+        is ResponseToolChoice.AllowedTools,
+        is ResponseToolChoice.Raw,
+        -> null
+        ResponseToolChoice.Shell -> "shell"
+        ResponseToolChoice.ApplyPatch -> "apply_patch"
+        is ResponseToolChoice.Mcp -> "mcp"
+        is ResponseToolChoice.Hosted -> type
+    }
 
 data class ResponseReasoningConfig(
     val effort: ReasoningEffort? = null,
@@ -954,6 +1029,9 @@ data class OpenRouterRequestOptions(
     init {
         require(models.all { it.isNotBlank() }) { "OpenRouter models must not contain blank values" }
         require(transforms.all { it.isNotBlank() }) { "OpenRouter transforms must not contain blank values" }
+        require(!(provider != null && providerRouting != null)) {
+            "OpenRouter request options cannot set provider and providerRouting together"
+        }
     }
 
     override fun applyTo(builder: kotlinx.serialization.json.JsonObjectBuilder) {
@@ -1078,6 +1156,9 @@ data class ResponseCreateRequest(
             "safetyIdentifier must be at most 64 characters when set"
         }
         require(user == null || user.isNotBlank()) { "user must not be blank when set" }
+        require(toolChoice !is ResponseToolChoice.AllowedTools) {
+            "allowed_tools tool choice is only supported on chat completions in this client"
+        }
     }
 
     fun requireCompatibleWith(provider: OpenAIProvider) {
@@ -1088,6 +1169,11 @@ data class ResponseCreateRequest(
         provider.requireStatelessResponses(
             previousResponseId = previousResponseId,
             store = store,
+        )
+        provider.requireBuiltinToolCompatibility(
+            surface = "Responses",
+            tools = tools,
+            toolChoice = toolChoice,
         )
         when (provider) {
             is OpenAIProvider.XAI -> {
@@ -2115,6 +2201,14 @@ data class ResponseObject(
     val user: String? = null,
     val metadata: JsonObject? = null,
 ) {
+    private fun requireSingleOutputMessage(helper: String): ResponseOutputItem {
+        val messages = outputMessages()
+        check(messages.size == 1) {
+            "$helper requires exactly one assistant message; use outputTexts() for multi-message responses"
+        }
+        return messages.single()
+    }
+
     fun outputMessages(): List<ResponseOutputItem> = output.filter { it.type == ResponseItemType.Message }
 
     fun functionCalls(): List<ResponseFunctionCall> = output.mapNotNull { it.asFunctionCallOrNull() }
@@ -2155,11 +2249,13 @@ data class ResponseObject(
 
     fun incompleteReasonOrNull(): ResponseIncompleteReason? = incompleteDetails?.reason
 
-    fun outputText(): String =
-        outputMessages().joinToString(separator = "") { it.textContent() }
+    fun outputTexts(): List<String> = outputMessages().map { it.textContent() }
+
+    fun outputText(): String = requireSingleOutputMessage("Response outputText()").textContent()
 
     fun outputJsonElementOrNull(): JsonElement? =
-        outputText()
+        requireSingleOutputMessage("Response outputJsonElementOrNull()")
+            .textContent()
             .takeIf { it.isNotBlank() }
             ?.let { text -> runCatching { OpenAIJson.parseToJsonElement(text) }.getOrNull() }
 

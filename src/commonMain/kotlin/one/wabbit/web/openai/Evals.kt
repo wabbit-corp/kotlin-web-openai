@@ -1,12 +1,16 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package one.wabbit.web.openai
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 
 enum class EvalListOrder(val wireName: String) {
@@ -65,7 +69,7 @@ sealed interface EvalRunOutputItemStatus {
     }
 
     data object Failed : EvalRunOutputItemStatus {
-        override val wireName: String = "failed"
+        override val wireName: String = "fail"
     }
 
     data class Unknown(
@@ -87,17 +91,25 @@ internal object EvalRunOutputItemStatusSerializer :
 
 data class EvalCreateRequest(
     val name: String,
+    val dataSourceConfig: JsonObject,
+    val testingCriteria: List<JsonObject>,
     val metadata: Map<String, String> = emptyMap(),
     val extraBody: JsonExtras? = null,
 ) {
     init {
         require(name.isNotBlank()) { "eval name must not be blank" }
+        require(dataSourceConfig.isNotEmpty()) { "eval dataSourceConfig must not be empty" }
+        require(testingCriteria.isNotEmpty()) { "eval testingCriteria must not be empty" }
         require(metadata.keys.all { it.isNotBlank() }) { "eval metadata keys must not be blank" }
     }
 
     fun toJson(): JsonObject =
         buildJsonObject {
             put("name", name)
+            put("data_source_config", dataSourceConfig)
+            putJsonArray("testing_criteria") {
+                testingCriteria.forEach { add(it) }
+            }
             if (metadata.isNotEmpty()) {
                 putJsonObject("metadata") {
                     metadata.forEach { (key, value) -> put(key, value) }
@@ -148,6 +160,26 @@ data class EvalListQuery(
 }
 
 @Serializable
+data class EvalDataSourceConfigObject(
+    val type: String? = null,
+    val metadata: JsonObject? = null,
+    val schema: JsonObject? = null,
+    @SerialName("item_schema") val itemSchema: JsonObject? = null,
+    @SerialName("include_sample_schema") val includeSampleSchema: Boolean? = null,
+)
+
+@Serializable
+data class EvalTestingCriterionObject(
+    val name: String? = null,
+    val type: String? = null,
+    val model: String? = null,
+    val input: JsonArray? = null,
+    @SerialName("passing_labels") val passingLabels: List<String> = emptyList(),
+    val labels: List<String> = emptyList(),
+    val metadata: JsonObject? = null,
+)
+
+@Serializable
 data class EvalObject(
     val id: String,
     @SerialName("object") val objectType: String? = null,
@@ -156,6 +188,8 @@ data class EvalObject(
     @SerialName("updated_at") val updatedAt: Long? = null,
     val status: String? = null,
     val metadata: JsonObject? = null,
+    @SerialName("data_source_config") val dataSourceConfig: EvalDataSourceConfigObject? = null,
+    @SerialName("testing_criteria") val testingCriteria: List<EvalTestingCriterionObject> = emptyList(),
     val config: JsonObject? = null,
 )
 
@@ -170,17 +204,20 @@ data class EvalPage(
 
 data class EvalRunCreateRequest(
     val name: String? = null,
+    val dataSource: JsonObject,
     val metadata: Map<String, String> = emptyMap(),
     val extraBody: JsonExtras? = null,
 ) {
     init {
         require(name == null || name.isNotBlank()) { "eval run name must not be blank when set" }
+        require(dataSource.isNotEmpty()) { "eval run dataSource must not be empty" }
         require(metadata.keys.all { it.isNotBlank() }) { "eval run metadata keys must not be blank" }
     }
 
     fun toJson(): JsonObject =
         buildJsonObject {
             name?.let { put("name", it) }
+            put("data_source", dataSource)
             if (metadata.isNotEmpty()) {
                 putJsonObject("metadata") {
                     metadata.forEach { (key, value) -> put(key, value) }
@@ -255,6 +292,23 @@ data class EvalRunOutputItemListQuery(
 }
 
 @Serializable
+data class EvalRunResultCounts(
+    val total: Int? = null,
+    val errored: Int? = null,
+    val failed: Int? = null,
+    val passed: Int? = null,
+)
+
+@Serializable
+data class EvalRunDataSourceObject(
+    val type: String? = null,
+    val source: JsonObject? = null,
+    @SerialName("input_messages") val inputMessages: JsonObject? = null,
+    @SerialName("sampling_params") val samplingParams: JsonObject? = null,
+    val model: String? = null,
+)
+
+@Serializable
 data class EvalRunObject(
     val id: String,
     @SerialName("object") val objectType: String? = null,
@@ -266,6 +320,12 @@ data class EvalRunObject(
     val metadata: JsonObject? = null,
     @SerialName("eval_id") val evalId: String? = null,
     val model: String? = null,
+    @SerialName("report_url") val reportUrl: String? = null,
+    @SerialName("data_source") val dataSource: EvalRunDataSourceObject? = null,
+    @SerialName("result_counts") val resultCounts: EvalRunResultCounts? = null,
+    @SerialName("per_model_usage") val perModelUsage: JsonArray? = null,
+    @SerialName("per_testing_criteria_results") val perTestingCriteriaResults: JsonArray? = null,
+    val error: JsonObject? = null,
     val result: JsonObject? = null,
 )
 
@@ -276,6 +336,21 @@ data class EvalRunPage(
     @SerialName("first_id") val firstId: String? = null,
     @SerialName("last_id") val lastId: String? = null,
     @SerialName("has_more") val hasMore: Boolean = false,
+)
+
+@Serializable
+data class EvalRunOutputItemResult(
+    val name: String? = null,
+    val passed: Boolean? = null,
+    val score: Double? = null,
+    val metadata: JsonObject? = null,
+)
+
+@Serializable
+data class EvalRunOutputItemSample(
+    val model: String? = null,
+    val input: JsonArray? = null,
+    val output: JsonArray? = null,
 )
 
 @Serializable
@@ -290,8 +365,8 @@ data class EvalRunOutputItemObject(
     @Serializable(with = EvalRunOutputItemStatusSerializer::class)
     val status: EvalRunOutputItemStatus? = null,
     val type: String? = null,
-    val sample: JsonObject? = null,
-    val results: JsonArray? = null,
+    val sample: EvalRunOutputItemSample? = null,
+    val results: List<EvalRunOutputItemResult> = emptyList(),
     val result: JsonObject? = null,
     val metadata: JsonObject? = null,
 )

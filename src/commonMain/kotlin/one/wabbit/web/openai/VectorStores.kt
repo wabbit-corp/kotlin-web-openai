@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package one.wabbit.web.openai
 
 import kotlinx.serialization.SerialName
@@ -104,6 +106,81 @@ sealed interface VectorStoreChunkingStrategy {
                     put("chunk_overlap_tokens", config.chunkOverlapTokens)
                 }
             }
+    }
+}
+
+sealed interface VectorStoreAttributeValue {
+    fun toJsonPrimitive(): JsonPrimitive
+
+    data class Text(
+        val value: String,
+    ) : VectorStoreAttributeValue {
+        override fun toJsonPrimitive(): JsonPrimitive = JsonPrimitive(value)
+    }
+
+    data class NumberValue(
+        val value: Number,
+    ) : VectorStoreAttributeValue {
+        init {
+            when (value) {
+                is Double -> require(value.isFinite()) { "vector store numeric attributes must be finite" }
+                is Float -> require(value.isFinite()) { "vector store numeric attributes must be finite" }
+            }
+        }
+
+        override fun toJsonPrimitive(): JsonPrimitive = JsonPrimitive(value)
+    }
+
+    data class BooleanValue(
+        val value: Boolean,
+    ) : VectorStoreAttributeValue {
+        override fun toJsonPrimitive(): JsonPrimitive = JsonPrimitive(value)
+    }
+
+    companion object {
+        fun of(value: Any): VectorStoreAttributeValue =
+            when (value) {
+                is VectorStoreAttributeValue -> value
+                is String -> Text(value)
+                is Number -> NumberValue(value)
+                is Boolean -> BooleanValue(value)
+                else -> error(
+                    "vector store attribute values must be string, number, boolean, or VectorStoreAttributeValue; got ${value::class.simpleName}",
+                )
+            }
+    }
+}
+
+data class VectorStoreAttributes(
+    val entries: Map<String, VectorStoreAttributeValue>,
+) {
+    init {
+        require(entries.keys.all { it.isNotBlank() }) { "vector store attribute keys must not be blank" }
+    }
+
+    fun isEmpty(): Boolean = entries.isEmpty()
+
+    fun toJson(): JsonObject = JsonObject(entries.mapValues { (_, value) -> value.toJsonPrimitive() })
+
+    operator fun get(key: String): VectorStoreAttributeValue? = entries[key]
+
+    companion object {
+        fun empty(): VectorStoreAttributes = VectorStoreAttributes(emptyMap())
+
+        fun of(vararg entries: Pair<String, Any>): VectorStoreAttributes =
+            of(entries.asList())
+
+        fun of(entries: Iterable<Pair<String, Any>>): VectorStoreAttributes =
+            VectorStoreAttributes(
+                buildMap {
+                    entries.forEach { (key, value) ->
+                        put(key, VectorStoreAttributeValue.of(value))
+                    }
+                },
+            )
+
+        fun strings(entries: Map<String, String>): VectorStoreAttributes =
+            VectorStoreAttributes(entries.mapValues { (_, value) -> VectorStoreAttributeValue.Text(value) })
     }
 }
 
@@ -304,21 +381,15 @@ data class VectorStoreSearchRequest(
 
 data class VectorStoreFileCreateRequest(
     val fileId: FileId,
-    val attributes: Map<String, String> = emptyMap(),
+    val attributes: VectorStoreAttributes = VectorStoreAttributes.empty(),
     val chunkingStrategy: VectorStoreChunkingStrategy? = null,
     val extraBody: JsonExtras? = null,
 ) {
-    init {
-        require(attributes.keys.all { it.isNotBlank() }) { "vector store file attributes keys must not be blank" }
-    }
-
     fun toJson(): JsonObject =
         buildJsonObject {
             put("file_id", fileId.value)
-            if (attributes.isNotEmpty()) {
-                putJsonObject("attributes") {
-                    attributes.forEach { (key, value) -> put(key, value) }
-                }
+            if (!attributes.isEmpty()) {
+                put("attributes", attributes.toJson())
             }
             chunkingStrategy?.let { put("chunking_strategy", it.toJson()) }
             putJsonExtras(extraBody)
@@ -326,19 +397,19 @@ data class VectorStoreFileCreateRequest(
 }
 
 data class VectorStoreFileUpdateRequest(
-    val attributes: JsonObject? = null,
+    val attributes: VectorStoreAttributes? = null,
     val chunkingStrategy: VectorStoreChunkingStrategy? = null,
     val extraBody: JsonExtras? = null,
 ) {
     init {
-        require(attributes == null || attributes.keys.all { it.isNotBlank() }) {
-            "vector store file update attribute keys must not be blank when set"
+        require(attributes == null || !attributes.isEmpty()) {
+            "vector store file update attributes must not be empty when set"
         }
     }
 
     fun toJson(): JsonObject =
         buildJsonObject {
-            attributes?.let { put("attributes", it) }
+            attributes?.let { put("attributes", it.toJson()) }
             chunkingStrategy?.let { put("chunking_strategy", it.toJson()) }
             putJsonExtras(extraBody)
         }
@@ -374,28 +445,57 @@ data class VectorStoreFileListQuery(
 }
 
 data class VectorStoreFileBatchCreateRequest(
-    val fileIds: List<FileId>,
-    val attributes: Map<String, String> = emptyMap(),
+    val fileIds: List<FileId> = emptyList(),
+    val files: List<VectorStoreFileBatchInput> = emptyList(),
+    val attributes: VectorStoreAttributes? = null,
     val chunkingStrategy: VectorStoreChunkingStrategy? = null,
     val extraBody: JsonExtras? = null,
 ) {
     init {
-        require(fileIds.isNotEmpty()) { "vector store file batch must contain at least one file id" }
-        require(attributes.keys.all { it.isNotBlank() }) { "vector store file batch attributes keys must not be blank" }
+        require(fileIds.isNotEmpty() || files.isNotEmpty()) {
+            "vector store file batch must contain either fileIds or files"
+        }
+        require(fileIds.isEmpty() || files.isEmpty()) {
+            "vector store file batch fileIds and files are mutually exclusive"
+        }
+        require(
+            files.isEmpty() || attributes == null || attributes.isEmpty(),
+        ) {
+            "vector store file batch global attributes must not be set when using per-file files"
+        }
+        require(files.isEmpty() || chunkingStrategy == null) {
+            "vector store file batch global chunkingStrategy must not be set when using per-file files"
+        }
     }
 
     fun toJson(): JsonObject =
         buildJsonObject {
-            putJsonArray("file_ids") {
-                fileIds.forEach { add(JsonPrimitive(it.value)) }
-            }
-            if (attributes.isNotEmpty()) {
-                putJsonObject("attributes") {
-                    attributes.forEach { (key, value) -> put(key, value) }
+            if (fileIds.isNotEmpty()) {
+                putJsonArray("file_ids") {
+                    fileIds.forEach { add(JsonPrimitive(it.value)) }
                 }
             }
+            if (files.isNotEmpty()) {
+                putJsonArray("files") {
+                    files.forEach { add(it.toJson()) }
+                }
+            }
+            attributes?.takeUnless { it.isEmpty() }?.let { put("attributes", it.toJson()) }
             chunkingStrategy?.let { put("chunking_strategy", it.toJson()) }
             putJsonExtras(extraBody)
+        }
+}
+
+data class VectorStoreFileBatchInput(
+    val fileId: FileId,
+    val attributes: VectorStoreAttributes? = null,
+    val chunkingStrategy: VectorStoreChunkingStrategy? = null,
+) {
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("file_id", fileId.value)
+            attributes?.takeUnless { it.isEmpty() }?.let { put("attributes", it.toJson()) }
+            chunkingStrategy?.let { put("chunking_strategy", it.toJson()) }
         }
 }
 

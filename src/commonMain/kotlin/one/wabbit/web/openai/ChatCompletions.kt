@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package one.wabbit.web.openai
 
 import kotlinx.coroutines.flow.Flow
@@ -21,6 +23,7 @@ enum class ChatRole(val wireName: String) {
     USER("user"),
     ASSISTANT("assistant"),
     TOOL("tool"),
+    FUNCTION("function"),
 }
 
 sealed interface ChatMessageContent {
@@ -130,6 +133,44 @@ sealed interface ChatMessagePart {
     }
 }
 
+enum class ChatCompletionModality(val wireName: String) {
+    TEXT("text"),
+    AUDIO("audio"),
+}
+
+enum class ChatCompletionAudioFormat(val wireName: String) {
+    WAV("wav"),
+    AAC("aac"),
+    MP3("mp3"),
+    FLAC("flac"),
+    OPUS("opus"),
+    PCM16("pcm16"),
+}
+
+data class ChatMessageAudioReference(
+    val id: String,
+) {
+    init {
+        require(id.isNotBlank()) { "chat message audio id must not be blank" }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("id", id)
+        }
+}
+
+data class ChatCompletionAudioConfig(
+    val format: ChatCompletionAudioFormat,
+    val voice: SpeechVoice,
+) {
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            put("format", format.wireName)
+            put("voice", voice.toJsonElement())
+        }
+}
+
 data class ChatToolCall(
     val id: ToolCallId,
     val functionName: String,
@@ -153,6 +194,7 @@ data class ChatToolCall(
 data class ChatMessage(
     val role: ChatRole,
     val content: ChatMessageContent? = null,
+    val audio: ChatMessageAudioReference? = null,
     val name: String? = null,
     val toolCallId: ToolCallId? = null,
     val toolCalls: List<ChatToolCall> = emptyList(),
@@ -165,6 +207,12 @@ data class ChatMessage(
             "chat message must provide content, toolCalls, or refusal"
         }
         require(name == null || name.isNotBlank()) { "chat message name must not be blank when set" }
+        require(role != ChatRole.FUNCTION || name != null) {
+            "chat function messages require name"
+        }
+        require(audio == null || role == ChatRole.ASSISTANT) {
+            "chat message audio continuation is only supported for assistant messages"
+        }
         require(reasoningContent == null || reasoningContent.isNotBlank()) {
             "chat message reasoningContent must not be blank when set"
         }
@@ -174,6 +222,7 @@ data class ChatMessage(
         buildJsonObject {
             put("role", role.wireName)
             content?.let { put("content", it.toJson()) }
+            audio?.let { put("audio", it.toJson()) }
             name?.let { put("name", it) }
             toolCallId?.let { put("tool_call_id", it.value) }
             if (toolCalls.isNotEmpty()) {
@@ -347,9 +396,27 @@ data class ChatWebSearchOptions(
         }
 }
 
+data class StoredChatCompletionUpdateRequest(
+    val metadata: Map<String, String>,
+) {
+    init {
+        require(metadata.isNotEmpty()) { "stored chat completion metadata must not be empty" }
+        require(metadata.keys.all { it.isNotBlank() }) { "stored chat completion metadata keys must not be blank" }
+    }
+
+    fun toJson(): JsonObject =
+        buildJsonObject {
+            putJsonObject("metadata") {
+                metadata.forEach { (key, value) -> put(key, value) }
+            }
+        }
+}
+
 data class ChatCompletionRequest(
     val model: ModelId,
     val messages: List<ChatMessage>,
+    val modalities: List<ChatCompletionModality> = emptyList(),
+    val audio: ChatCompletionAudioConfig? = null,
     val temperature: Double? = null,
     val topP: Double? = null,
     val maxCompletionTokens: Int? = null,
@@ -375,6 +442,13 @@ data class ChatCompletionRequest(
 ) {
     init {
         require(messages.isNotEmpty()) { "chat completion messages must not be empty" }
+        require(modalities.distinct().size == modalities.size) { "chat completion modalities must not contain duplicates" }
+        require(audio == null || modalities.contains(ChatCompletionModality.AUDIO)) {
+            "chat completion audio output config requires modalities to include audio"
+        }
+        require(!modalities.contains(ChatCompletionModality.AUDIO) || audio != null) {
+            "chat completion modalities including audio require audio output config"
+        }
         require(maxCompletionTokens == null || maxCompletionTokens > 0) {
             "maxCompletionTokens must be positive when set"
         }
@@ -388,11 +462,24 @@ data class ChatCompletionRequest(
         }
         require(stop.all { it.isNotBlank() }) { "stop values must not be blank" }
         require(user == null || user.isNotBlank()) { "chat completion user must not be blank when set" }
-        require(tools.all { it is ResponseTool.Function || it is ResponseTool.Raw }) {
-            "chat completions only support function tools in this client"
+        require(tools.all { it is ResponseTool.Function || it is ResponseTool.Custom || it is ResponseTool.Raw }) {
+            "chat completions only support function and custom tools in this client"
         }
-        require(toolChoice !is ResponseToolChoice.Hosted && toolChoice !is ResponseToolChoice.Mcp) {
-            "chat completions do not support hosted or MCP tool choices in this client"
+        require(
+            toolChoice !is ResponseToolChoice.Hosted &&
+                toolChoice !is ResponseToolChoice.Mcp &&
+                toolChoice != ResponseToolChoice.Shell &&
+                toolChoice != ResponseToolChoice.ApplyPatch,
+        ) {
+            "chat completions only support function, custom, and allowed_tools tool choices in this client"
+        }
+        if (toolChoice is ResponseToolChoice.AllowedTools) {
+            require(tools.isEmpty()) {
+                "chat completion allowed_tools tool choice must not be combined with top-level tools"
+            }
+            require(toolChoice.tools.all { it is ResponseTool.Function || it is ResponseTool.Custom || it is ResponseTool.Raw }) {
+                "chat completion allowed_tools only support function and custom tools in this client"
+            }
         }
     }
 
@@ -412,6 +499,11 @@ data class ChatCompletionRequest(
                 "${provider.id} does not expose structured chat-completion output controls in this client"
             }
         }
+        provider.requireBuiltinToolCompatibility(
+            surface = "chat completion",
+            tools = tools,
+            toolChoice = toolChoice,
+        )
         providerOptions?.requireCompatibleWith(provider)
         provider.requireAzureChatCompatibility(
             reasoningEffort = reasoningEffort,
@@ -452,6 +544,12 @@ data class ChatCompletionRequest(
             putJsonArray("messages") {
                 messages.forEach { add(it.toJson()) }
             }
+            if (modalities.isNotEmpty()) {
+                putJsonArray("modalities") {
+                    modalities.forEach { add(JsonPrimitive(it.wireName)) }
+                }
+            }
+            audio?.let { put("audio", it.toJson()) }
             temperature?.let { put("temperature", it) }
             topP?.let { put("top_p", it) }
             maxCompletionTokens?.let { put("max_completion_tokens", it) }
@@ -502,13 +600,21 @@ private fun ResponseTool.toChatJson(): JsonObject =
                     strict?.let { put("strict", it) }
                 }
             }
+        is ResponseTool.Custom ->
+            buildJsonObject {
+                put("type", "custom")
+                putJsonObject("custom") {
+                    put("name", name)
+                    description?.let { put("description", it) }
+                    format?.let { put("format", it.toChatJson()) }
+                }
+            }
         is ResponseTool.Raw -> json
-        is ResponseTool.Custom,
         ResponseTool.LocalShell,
         is ResponseTool.Shell,
         ResponseTool.ApplyPatch,
-        -> error("chat completions only support function tools in this client")
-        else -> error("chat completions only support function tools in this client")
+        -> error("chat completions only support function and custom tools in this client")
+        else -> error("chat completions only support function and custom tools in this client")
     }
 
 private fun ResponseToolChoice.toChatJson(): JsonElement =
@@ -525,16 +631,44 @@ private fun ResponseToolChoice.toChatJson(): JsonElement =
                     put("name", name)
                 }
             }
-        ResponseToolChoice.Shell ->
-            error("chat completions do not support shell tool choices in this client")
-        ResponseToolChoice.ApplyPatch ->
-            error("chat completions do not support apply-patch tool choices in this client")
         is ResponseToolChoice.Custom ->
-            error("chat completions do not support custom tool choices in this client")
+            buildJsonObject {
+                put("type", "custom")
+                putJsonObject("custom") {
+                    put("name", name)
+                }
+            }
+        is ResponseToolChoice.AllowedTools ->
+            buildJsonObject {
+                put("type", "allowed_tools")
+                putJsonObject("allowed_tools") {
+                    put("mode", mode.wireName)
+                    putJsonArray("tools") {
+                        tools.forEach { add(it.toChatJson()) }
+                    }
+                }
+            }
+        ResponseToolChoice.Shell ->
+            error("chat completions only support function and custom tool choices in this client")
+        ResponseToolChoice.ApplyPatch ->
+            error("chat completions only support function and custom tool choices in this client")
         is ResponseToolChoice.Mcp ->
-            error("chat completions do not support MCP tool choices in this client")
+            error("chat completions only support function and custom tool choices in this client")
         is ResponseToolChoice.Hosted ->
-            error("chat completions do not support hosted tool choices in this client")
+            error("chat completions only support function and custom tool choices in this client")
+    }
+
+private fun ResponseTool.CustomInputFormat.toChatJson(): JsonObject =
+    when (this) {
+        is ResponseTool.CustomInputFormat.Grammar ->
+            buildJsonObject {
+                put("type", "grammar")
+                putJsonObject("grammar") {
+                    put("definition", definition)
+                    put("syntax", syntax.wireName)
+                }
+            }
+        is ResponseTool.CustomInputFormat.Raw -> json
     }
 
 private fun ChatMessage.hasAudioInput(): Boolean =
@@ -612,6 +746,10 @@ sealed interface ChatCompletionToolCallType {
         override val wireName: String = "function"
     }
 
+    data object Custom : ChatCompletionToolCallType {
+        override val wireName: String = "custom"
+    }
+
     data class Unknown(
         override val wireName: String,
     ) : ChatCompletionToolCallType
@@ -620,10 +758,16 @@ sealed interface ChatCompletionToolCallType {
 internal object ChatCompletionToolCallTypeSerializer :
     PreservingWireValueSerializer<ChatCompletionToolCallType>(
         serialName = "one.wabbit.web.openai.ChatCompletionToolCallType?",
-        knownValues = listOf(ChatCompletionToolCallType.Function),
+        knownValues = listOf(ChatCompletionToolCallType.Function, ChatCompletionToolCallType.Custom),
         wireName = ChatCompletionToolCallType::wireName,
         unknown = ChatCompletionToolCallType::Unknown,
     )
+
+@Serializable
+data class ChatCompletionToolCallCustom(
+    val name: String? = null,
+    val input: String? = null,
+)
 
 @Serializable
 data class ChatCompletionLogProb(
@@ -653,15 +797,26 @@ data class ChatCompletionToolCallDelta(
     @Serializable(with = ChatCompletionToolCallTypeSerializer::class)
     val type: ChatCompletionToolCallType? = null,
     val function: ChatCompletionToolCallFunction? = null,
+    val custom: ChatCompletionToolCallCustom? = null,
+)
+
+@Serializable
+data class ChatCompletionAudioObject(
+    val id: String? = null,
+    val data: String? = null,
+    @SerialName("expires_at") val expiresAt: Long? = null,
+    val transcript: String? = null,
 )
 
 @Serializable
 data class ChatCompletionMessageObject(
     val role: String? = null,
     val content: String? = null,
+    val audio: ChatCompletionAudioObject? = null,
     val refusal: String? = null,
     val annotations: JsonArray? = null,
-    @SerialName("tool_calls") val toolCalls: List<ChatCompletionToolCallDelta> = emptyList(),
+    @SerialName("function_call") val functionCall: ChatCompletionToolCallFunction? = null,
+    @SerialName("tool_calls") val toolCalls: List<ChatCompletionToolCallDelta>? = null,
     @SerialName("reasoning_content") val reasoningContent: String? = null,
 )
 
@@ -689,9 +844,25 @@ data class ChatCompletionResponse(
     val usage: ChatCompletionUsage? = null,
     @SerialName("system_fingerprint") val systemFingerprint: String? = null,
 ) {
-    fun outputText(): String = choices.mapNotNull { it.message?.content }.joinToString(separator = "")
+    private fun requireSingleChoice(helper: String): ChatCompletionChoice {
+        check(choices.size == 1) {
+            "$helper requires exactly one choice; use choiceTexts() or choiceReasoningContents() for multi-choice responses"
+        }
+        return choices.single()
+    }
 
-    fun reasoningContent(): String = choices.mapNotNull { it.message?.reasoningContent }.joinToString(separator = "")
+    fun choiceTexts(): List<String> = choices.map { it.message?.content.orEmpty() }
+
+    fun outputText(): String = requireSingleChoice("Chat completion outputText()").message?.content.orEmpty()
+
+    fun choiceReasoningContents(): List<String> = choices.map { it.message?.reasoningContent.orEmpty() }
+
+    fun reasoningContent(): String =
+        requireSingleChoice("Chat completion reasoningContent()").message?.reasoningContent.orEmpty()
+
+    fun audioOutputs(): List<ChatCompletionAudioObject> = choices.mapNotNull { it.message?.audio }
+
+    fun audioTranscripts(): List<String> = audioOutputs().mapNotNull { it.transcript }
 
     fun annotations(): List<JsonElement> = choices.flatMap { it.message?.annotations?.toList() ?: emptyList() }
 
@@ -701,7 +872,11 @@ data class ChatCompletionResponse(
     fun toolCalls(): List<ChatCompletionToolCallDelta> = choices.flatMap { it.message?.toolCalls ?: emptyList() }
 
     fun outputJsonElementOrNull(): JsonElement? =
-        outputText().takeIf { it.isNotBlank() }?.let { runCatching { OpenAIJson.parseToJsonElement(it) }.getOrNull() }
+        requireSingleChoice("Chat completion outputJsonElementOrNull()")
+            .message
+            ?.content
+            ?.takeIf { it.isNotBlank() }
+            ?.let { runCatching { OpenAIJson.parseToJsonElement(it) }.getOrNull() }
 
     inline fun <reified T> decodeOutputJson(): T =
         OpenAIJson.decodeFromJsonElement(outputJsonElementOrNull() ?: error("Chat completion output is not valid JSON"))
@@ -712,6 +887,7 @@ data class ChatCompletionChunkDelta(
     val role: String? = null,
     val content: String? = null,
     val annotations: JsonArray? = null,
+    @SerialName("function_call") val functionCall: ChatCompletionToolCallFunction? = null,
     @SerialName("tool_calls") val toolCalls: List<ChatCompletionToolCallDelta> = emptyList(),
     val refusal: String? = null,
     @SerialName("reasoning_content") val reasoningContent: String? = null,
@@ -765,20 +941,41 @@ fun parseChatCompletionStreamEvents(source: String): List<ChatCompletionStreamEv
     parseServerSentEvents(source).map(::parseChatCompletionStreamEvent)
 
 data class ChatCompletionStreamAssembly(
-    val outputText: String = "",
-    val reasoningContent: String = "",
-    val refusalText: String = "",
+    val choiceTexts: Map<Int, String> = emptyMap(),
+    val choiceReasoningContents: Map<Int, String> = emptyMap(),
+    val choiceRefusalTexts: Map<Int, String> = emptyMap(),
     val toolCallArguments: Map<String, String> = emptyMap(),
     val finishReasons: Map<Int, ChatCompletionFinishReason?> = emptyMap(),
     val lastChunk: ChatCompletionChunk? = null,
     val error: ResponseApiError? = null,
     val isDone: Boolean = false,
-)
+) {
+    private fun requireSingleChoiceText(helper: String, values: Map<Int, String>, structuredHelper: String): String {
+        check(values.size == 1) {
+            "$helper requires exactly one choice; use $structuredHelper for multi-choice streams"
+        }
+        return values.values.single()
+    }
+
+    val outputText: String
+        get() = requireSingleChoiceText("Chat completion stream outputText", choiceTexts, "choiceTexts")
+
+    val reasoningContent: String
+        get() =
+            requireSingleChoiceText(
+                "Chat completion stream reasoningContent",
+                choiceReasoningContents,
+                "choiceReasoningContents",
+            )
+
+    val refusalText: String
+        get() = requireSingleChoiceText("Chat completion stream refusalText", choiceRefusalTexts, "choiceRefusalTexts")
+}
 
 class ChatCompletionStreamAccumulator {
-    private val outputText = StringBuilder()
-    private val reasoningContent = StringBuilder()
-    private val refusalText = StringBuilder()
+    private val outputText = linkedMapOf<Int, StringBuilder>()
+    private val reasoningContent = linkedMapOf<Int, StringBuilder>()
+    private val refusalText = linkedMapOf<Int, StringBuilder>()
     private val toolCallArguments = linkedMapOf<String, StringBuilder>()
     private val finishReasons = linkedMapOf<Int, ChatCompletionFinishReason?>()
     private var lastChunk: ChatCompletionChunk? = null
@@ -790,13 +987,21 @@ class ChatCompletionStreamAccumulator {
             is ChatCompletionStreamEvent.Chunk -> {
                 lastChunk = event.chunk
                 event.chunk.choices.forEach { choice ->
-                    choice.delta?.content?.let { outputText.append(it) }
-                    choice.delta?.reasoningContent?.let { reasoningContent.append(it) }
-                    choice.delta?.refusal?.let { refusalText.append(it) }
+                    choice.delta?.content?.let { outputText.getOrPut(choice.index) { StringBuilder() }.append(it) }
+                    choice.delta?.reasoningContent?.let {
+                        reasoningContent.getOrPut(choice.index) { StringBuilder() }.append(it)
+                    }
+                    choice.delta?.refusal?.let { refusalText.getOrPut(choice.index) { StringBuilder() }.append(it) }
+                    choice.delta?.functionCall?.arguments?.let { argDelta ->
+                        toolCallArguments.getOrPut("choice:${choice.index}:function_call") { StringBuilder() }.append(argDelta)
+                    }
                     choice.delta?.toolCalls?.forEach { call ->
                         val key = call.id ?: "choice:${choice.index}:tool:${call.index ?: 0}"
                         call.function?.arguments?.let { argDelta ->
                             toolCallArguments.getOrPut(key) { StringBuilder() }.append(argDelta)
+                        }
+                        call.custom?.input?.let { inputDelta ->
+                            toolCallArguments.getOrPut(key) { StringBuilder() }.append(inputDelta)
                         }
                     }
                     finishReasons[choice.index] = choice.finishReason
@@ -811,11 +1016,13 @@ class ChatCompletionStreamAccumulator {
 
     fun snapshot(): ChatCompletionStreamAssembly =
         ChatCompletionStreamAssembly(
-            outputText = outputText.toString(),
-            reasoningContent = reasoningContent.toString(),
-            refusalText = refusalText.toString(),
+            choiceTexts = outputText.entries.sortedBy { it.key }.associateTo(linkedMapOf()) { it.key to it.value.toString() },
+            choiceReasoningContents =
+                reasoningContent.entries.sortedBy { it.key }.associateTo(linkedMapOf()) { it.key to it.value.toString() },
+            choiceRefusalTexts =
+                refusalText.entries.sortedBy { it.key }.associateTo(linkedMapOf()) { it.key to it.value.toString() },
             toolCallArguments = toolCallArguments.mapValues { it.value.toString() },
-            finishReasons = finishReasons.toMap(),
+            finishReasons = finishReasons.entries.sortedBy { it.key }.associate { it.toPair() },
             lastChunk = lastChunk,
             error = error,
             isDone = isDone,

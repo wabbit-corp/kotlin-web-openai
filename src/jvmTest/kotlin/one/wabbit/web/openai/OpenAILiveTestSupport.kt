@@ -1,13 +1,25 @@
+// SPDX-License-Identifier: LicenseRef-Wabbit-Public-Test-License
+
 package one.wabbit.web.openai
 
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import org.junit.Assume.assumeTrue
 
 data class LiveOpenAiConfig(
     val apiKey: String,
     val embeddingModel: String,
     val moderationModel: String,
+    val evalModel: String,
+    val evalGraderModel: String,
+    val chatAudioModel: String,
+    val chatAudioVoice: String,
+)
+
+data class LiveOpenAiVideoConfig(
+    val apiKey: String,
+    val videoModel: String,
 )
 
 data class LiveOpenRouterConfig(
@@ -53,9 +65,21 @@ data class LiveOllamaConfig(
     val chatModel: String?,
 )
 
+private const val LiveKeysEnvPathEnv = "WABBIT_LIVE_KEYS_ENV_PATH"
+private const val LiveRootPrivatePathEnv = "WABBIT_LIVE_ROOT_PRIVATE_PATH"
+private const val LiveVideoToggleEnv = "WABBIT_RUN_LIVE_OPENAI_VIDEO_TEST"
+
 private fun shouldRunLiveTests(): Boolean =
     System.getenv("WABBIT_RUN_LIVE_OPENAI_TEST") == "true" ||
         System.getenv("WABBIT_RUN_LIVE_PROVIDER_TESTS") == "true"
+
+internal fun <T : Any> requireLiveConfig(
+    config: T?,
+    reason: String,
+): T {
+    assumeTrue(reason, config != null)
+    return checkNotNull(config)
+}
 
 fun loadLiveOpenAiConfigOrNull(): LiveOpenAiConfig? {
     if (!shouldRunLiveTests()) return null
@@ -63,7 +87,30 @@ fun loadLiveOpenAiConfigOrNull(): LiveOpenAiConfig? {
     if (!apiKey.startsWith("sk-")) return null
     val embeddingModel = System.getenv("WABBIT_LIVE_OPENAI_EMBEDDING_MODEL")?.trim().orEmpty().ifBlank { "text-embedding-3-small" }
     val moderationModel = System.getenv("WABBIT_LIVE_OPENAI_MODERATION_MODEL")?.trim().orEmpty().ifBlank { "omni-moderation-latest" }
-    return LiveOpenAiConfig(apiKey = apiKey, embeddingModel = embeddingModel, moderationModel = moderationModel)
+    val evalModel = System.getenv("WABBIT_LIVE_OPENAI_EVAL_MODEL")?.trim().orEmpty().ifBlank { "gpt-4o-mini" }
+    val evalGraderModel = System.getenv("WABBIT_LIVE_OPENAI_EVAL_GRADER_MODEL")?.trim().orEmpty().ifBlank { evalModel }
+    val chatAudioModel = System.getenv("WABBIT_LIVE_OPENAI_CHAT_AUDIO_MODEL")?.trim().orEmpty().ifBlank { "gpt-audio-mini" }
+    val chatAudioVoice = System.getenv("WABBIT_LIVE_OPENAI_CHAT_AUDIO_VOICE")?.trim().orEmpty().ifBlank { "alloy" }
+    return LiveOpenAiConfig(
+        apiKey = apiKey,
+        embeddingModel = embeddingModel,
+        moderationModel = moderationModel,
+        evalModel = evalModel,
+        evalGraderModel = evalGraderModel,
+        chatAudioModel = chatAudioModel,
+        chatAudioVoice = chatAudioVoice,
+    )
+}
+
+fun loadLiveOpenAiVideoConfigOrNull(): LiveOpenAiVideoConfig? {
+    if (System.getenv(LiveVideoToggleEnv) != "true") return null
+    val apiKey = loadSecret("OPENAI_API_KEY", "OPENAI_KEY") ?: return null
+    if (!apiKey.startsWith("sk-")) return null
+    val videoModel = System.getenv("WABBIT_LIVE_OPENAI_VIDEO_MODEL")?.trim().orEmpty().ifBlank { "sora-2" }
+    return LiveOpenAiVideoConfig(
+        apiKey = apiKey,
+        videoModel = videoModel,
+    )
 }
 
 fun loadLiveOpenRouterConfigOrNull(): LiveOpenRouterConfig? {
@@ -143,8 +190,13 @@ private fun loadSecret(vararg envKeys: String): String? {
     return null
 }
 
+// Live test secret fallback is deliberately narrow:
+// 1. direct env vars
+// 2. explicitly configured secret files via WABBIT_LIVE_KEYS_ENV_PATH / WABBIT_LIVE_ROOT_PRIVATE_PATH
+// 3. repo-root keys.env / root.private.clj
+// It does not walk parent directories looking for secrets.
 private fun loadKeysEnv(): Map<String, String> {
-    val keysPath = findKeysEnvPath() ?: return emptyMap()
+    val keysPath = resolveLiveKeysEnvPath() ?: return emptyMap()
     val text = runCatching { Files.readString(keysPath) }.getOrNull() ?: return emptyMap()
     return text
         .lineSequence()
@@ -157,26 +209,51 @@ private fun loadKeysEnv(): Map<String, String> {
 }
 
 private fun loadOpenAiKeyFromRootPrivate(): String? {
-    val rootPrivate = findRootPrivatePath() ?: return null
+    val rootPrivate = resolveLiveRootPrivatePath() ?: return null
     val text = runCatching { Files.readString(rootPrivate) }.getOrNull() ?: return null
     val match = Regex("""\(openai-key\s+"([^"]+)"\)""").find(text) ?: return null
     return match.groupValues.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }
 }
 
-private fun findRootPrivatePath(): Path? {
-    val cwd = Paths.get("").toAbsolutePath().normalize()
-    val direct = cwd.parent?.resolve("root.private.clj")
-    if (direct != null && Files.exists(direct)) return direct
-    return generateSequence(cwd) { current -> current.parent }
-        .map { it.resolve("root.private.clj") }
-        .firstOrNull { Files.exists(it) }
+internal fun resolveLiveKeysEnvPath(
+    env: Map<String, String> = System.getenv(),
+    cwd: Path = Paths.get("").toAbsolutePath().normalize(),
+    exists: (Path) -> Boolean = Files::exists,
+): Path? = resolveLiveSecretPath(env[LiveKeysEnvPathEnv], "keys.env", cwd, exists)
+
+internal fun resolveLiveRootPrivatePath(
+    env: Map<String, String> = System.getenv(),
+    cwd: Path = Paths.get("").toAbsolutePath().normalize(),
+    exists: (Path) -> Boolean = Files::exists,
+): Path? = resolveLiveSecretPath(env[LiveRootPrivatePathEnv], "root.private.clj", cwd, exists)
+
+internal fun resolveLiveSecretPath(
+    configuredPath: String?,
+    defaultFileName: String,
+    cwd: Path = Paths.get("").toAbsolutePath().normalize(),
+    exists: (Path) -> Boolean = Files::exists,
+): Path? {
+    configuredPath
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.let { rawPath ->
+            val explicitPath = Paths.get(rawPath).toAbsolutePath().normalize()
+            return explicitPath.takeIf(exists)
+        }
+
+    val repoRoot = detectLiveTestRepoRoot(cwd, exists)
+    val defaultPath = repoRoot.resolve(defaultFileName).normalize()
+    return defaultPath.takeIf(exists)
 }
 
-private fun findKeysEnvPath(): Path? {
-    val cwd = Paths.get("").toAbsolutePath().normalize()
-    val direct = cwd.parent?.resolve("keys.env")
-    if (direct != null && Files.exists(direct)) return direct
-    return generateSequence(cwd) { current -> current.parent }
-        .map { it.resolve("keys.env") }
-        .firstOrNull { Files.exists(it) }
-}
+internal fun detectLiveTestRepoRoot(
+    cwd: Path = Paths.get("").toAbsolutePath().normalize(),
+    exists: (Path) -> Boolean = Files::exists,
+): Path =
+    generateSequence(cwd) { current -> current.parent }
+        .firstOrNull { candidate ->
+            exists(candidate.resolve(".git")) ||
+                exists(candidate.resolve("settings.gradle.kts")) ||
+                exists(candidate.resolve("build.gradle.kts"))
+        }
+        ?: cwd

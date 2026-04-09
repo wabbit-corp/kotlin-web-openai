@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Wabbit-Public-Test-License
+
 @file:OptIn(
     dev.whyoleg.cryptography.CryptographyProviderApi::class,
     dev.whyoleg.cryptography.DelicateCryptographyApi::class,
@@ -14,6 +16,7 @@ import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.MockRequestHandleScope
 import io.ktor.client.engine.mock.respond
 import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.HttpTimeoutCapability
 import io.ktor.client.request.HttpRequestData
 import io.ktor.client.request.HttpResponseData
 import io.ktor.http.ContentType
@@ -30,7 +33,9 @@ import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.flow.toList
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -39,13 +44,13 @@ import one.wabbit.web.common.RetryAction
 import one.wabbit.web.common.RetryPolicy
 import one.wabbit.web.common.Schedule
 import one.wabbit.web.common.Timeouts
-import java.io.IOException
 import kotlin.io.encoding.Base64
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -184,7 +189,7 @@ class OpenAIApiSpec {
     }
 
     @Test
-    fun `deriveStreamingTimeouts disables request and socket timeouts by default`() {
+    fun `deriveStreamingTimeouts disables request timeout and adds a default socket stall timeout`() {
         val derived =
             deriveStreamingTimeouts(
                 timeouts = Timeouts(request = 15.seconds, connect = 7.seconds, socket = 20.seconds),
@@ -193,7 +198,7 @@ class OpenAIApiSpec {
 
         assertNull(derived.request)
         assertEquals(7.seconds, derived.connect)
-        assertNull(derived.socket)
+        assertEquals(DefaultStreamingSocketTimeout, derived.socket)
     }
 
     @Test
@@ -206,6 +211,90 @@ class OpenAIApiSpec {
             )
 
         assertEquals(override, derived)
+    }
+
+    @Test
+    fun `streamResponse applies default socket stall timeout`() = runTest {
+        var seenTimeoutMillis: Triple<Long?, Long?, Long?>? = null
+        val client = httpClient { request ->
+            val timeout = request.getCapabilityOrNull(HttpTimeoutCapability)
+            seenTimeoutMillis =
+                Triple(
+                    timeout?.requestTimeoutMillis,
+                    timeout?.connectTimeoutMillis,
+                    timeout?.socketTimeoutMillis,
+                )
+            respond(
+                content = "data: [DONE]\n\n",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Text.EventStream.toString()),
+            )
+        }
+
+        val api =
+            KtorOpenAIApi(
+                client,
+                OpenAIApi.Config(
+                    apiKey = "secret",
+                    timeouts = Timeouts(request = 15.seconds, connect = 7.seconds, socket = 20.seconds),
+                ),
+            )
+
+        api
+            .streamResponse(
+                ResponseCreateRequest(
+                    model = ModelId("gpt-4.1-mini"),
+                    input = ResponseInput.Text("hello"),
+                ),
+            ).toList()
+
+        assertEquals(
+            Triple<Long?, Long?, Long?>(null, 7.seconds.inWholeMilliseconds, DefaultStreamingSocketTimeout.inWholeMilliseconds),
+            seenTimeoutMillis,
+        )
+    }
+
+    @Test
+    fun `streamResponse respects explicit streaming timeout override`() = runTest {
+        var seenTimeoutMillis: Triple<Long?, Long?, Long?>? = null
+        val client = httpClient { request ->
+            val timeout = request.getCapabilityOrNull(HttpTimeoutCapability)
+            seenTimeoutMillis =
+                Triple(
+                    timeout?.requestTimeoutMillis,
+                    timeout?.connectTimeoutMillis,
+                    timeout?.socketTimeoutMillis,
+                )
+            respond(
+                content = "data: [DONE]\n\n",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Text.EventStream.toString()),
+            )
+        }
+
+        val override = Timeouts(request = 90.seconds, connect = 5.seconds, socket = 30.seconds)
+        val api =
+            KtorOpenAIApi(
+                client,
+                OpenAIApi.Config(
+                    apiKey = "secret",
+                    timeouts = Timeouts(request = 15.seconds, connect = 7.seconds, socket = 20.seconds),
+                    streamingTimeouts = override,
+                ),
+            )
+
+        api
+            .streamResponse(
+                ResponseCreateRequest(
+                    model = ModelId("gpt-4.1-mini"),
+                    input = ResponseInput.Text("hello"),
+                ),
+            ).toList()
+
+        assertEquals(
+            Triple<Long?, Long?, Long?>(override.request?.inWholeMilliseconds, override.connect?.inWholeMilliseconds, override.socket?.inWholeMilliseconds),
+            seenTimeoutMillis,
+        )
     }
 
     @Test
@@ -260,7 +349,45 @@ class OpenAIApiSpec {
     }
 
     @Test
-    fun `createResponse parse errors retain a body sample`() = runTest {
+    fun `response helpers expose structured message texts and reject merged multi message output`() {
+        val response =
+            ResponseObject(
+                id = "resp_multi",
+                output =
+                    listOf(
+                        ResponseOutputItem(
+                            id = "msg_1",
+                            type = ResponseItemType.Message,
+                            role = "assistant",
+                            content = listOf(ResponseContentPart(type = "output_text", text = """{"city":"Paris"}""")),
+                        ),
+                        ResponseOutputItem(
+                            id = "fc_1",
+                            type = ResponseItemType.FunctionCall,
+                            callId = "call_1",
+                            name = "lookup_weather",
+                            arguments = """{"city":"Paris"}""",
+                        ),
+                        ResponseOutputItem(
+                            id = "msg_2",
+                            type = ResponseItemType.Message,
+                            role = "assistant",
+                            content = listOf(ResponseContentPart(type = "output_text", text = """{"city":"Tokyo"}""")),
+                        ),
+                    ),
+            )
+
+        assertEquals(listOf("""{"city":"Paris"}""", """{"city":"Tokyo"}"""), response.outputTexts())
+
+        val textError = assertFailsWith<IllegalStateException> { response.outputText() }
+        assertTrue(textError.message.orEmpty().contains("outputTexts()"))
+
+        val jsonError = assertFailsWith<IllegalStateException> { response.outputJsonElementOrNull() }
+        assertTrue(jsonError.message.orEmpty().contains("outputTexts()"))
+    }
+
+    @Test
+    fun `createResponse parse errors hide body sample in message by default`() = runTest {
         val client = httpClient {
             respond(
                 content = """{"id":"resp_bad","object":"response","status":"completed","output":"oops"}""",
@@ -280,8 +407,151 @@ class OpenAIApiSpec {
                 )
             }
 
+        assertTrue(error.message.orEmpty().contains("Failed to parse response"))
+        assertTrue(!error.message.orEmpty().contains("\"output\":\"oops\""))
+        assertEquals("""{"id":"resp_bad","object":"response","status":"completed","output":"oops"}""", error.bodySample)
+    }
+
+    @Test
+    fun `createResponse parse errors include body sample in message when explicitly enabled`() = runTest {
+        val client = httpClient {
+            respond(
+                content = """{"id":"resp_bad","object":"response","status":"completed","output":"oops"}""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+
+        val api =
+            KtorOpenAIApi(
+                client,
+                OpenAIApi.Config(
+                    apiKey = "secret",
+                    includeBodySamplesInExceptions = true,
+                ),
+            )
+        val error =
+            assertFailsWith<OpenAIApiError.Parse> {
+                api.createResponse(
+                    ResponseCreateRequest(
+                        model = ModelId("gpt-4.1-mini"),
+                        input = ResponseInput.Text("Say hello"),
+                    ),
+                )
+            }
+
         assertTrue(error.message.orEmpty().contains("\"output\":\"oops\""))
         assertEquals("""{"id":"resp_bad","object":"response","status":"completed","output":"oops"}""", error.bodySample)
+    }
+
+    @Test
+    fun `opt-in parse errors redact sensitive json body samples`() = runTest {
+        val client = httpClient {
+            respond(
+                content =
+                    """
+                    {
+                      "id":"resp_bad",
+                      "object":"response",
+                      "status":"completed",
+                      "output":"oops",
+                      "client_secret":"cs_123",
+                      "nested":{"authorization":"Bearer sk-secret"},
+                      "download_url":"https://files.example.invalid/file?sig=abc123&expires=10"
+                    }
+                    """.trimIndent(),
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+
+        val api =
+            KtorOpenAIApi(
+                client,
+                OpenAIApi.Config(
+                    apiKey = "secret",
+                    includeBodySamplesInExceptions = true,
+                ),
+            )
+        val error =
+            assertFailsWith<OpenAIApiError.Parse> {
+                api.createResponse(
+                    ResponseCreateRequest(
+                        model = ModelId("gpt-4.1-mini"),
+                        input = ResponseInput.Text("Say hello"),
+                    ),
+                )
+            }
+
+        val sample = OpenAIJson.parseToJsonElement(assertNotNull(error.bodySample)).jsonObject
+        assertEquals("[REDACTED]", sample["client_secret"]?.jsonPrimitive?.content)
+        assertEquals(
+            "[REDACTED]",
+            sample["nested"]?.jsonObject?.get("authorization")?.jsonPrimitive?.content,
+        )
+        assertEquals(
+            "https://files.example.invalid/file?sig=[REDACTED]&expires=10",
+            sample["download_url"]?.jsonPrimitive?.content,
+        )
+        assertTrue(error.message.orEmpty().contains("[REDACTED]"))
+        assertTrue(!error.message.orEmpty().contains("cs_123"))
+        assertTrue(!error.message.orEmpty().contains("sk-secret"))
+        assertTrue(!error.message.orEmpty().contains("abc123"))
+    }
+
+    @Test
+    fun `raw http errors hide body sample in message by default`() = runTest {
+        val client = httpClient {
+            respond(
+                content = "signed_url=https://files.example.invalid/secret-token",
+                status = HttpStatusCode.BadGateway,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Text.Plain.toString()),
+            )
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        val error =
+            assertFailsWith<OpenAIApiError.Http> {
+                api.getModel(ModelId("gpt-4.1-mini"))
+            }
+
+        assertTrue(error.message.orEmpty().contains("HTTP 502"))
+        assertTrue(!error.message.orEmpty().contains("signed_url="))
+        assertEquals("signed_url=[REDACTED]", error.bodySample)
+    }
+
+    @Test
+    fun `opt-in raw http errors redact sensitive plain text body samples`() = runTest {
+        val client = httpClient {
+            respond(
+                content =
+                    "authorization=Bearer sk-secret api_key=sk-123 signed_url=https://files.example.invalid/file?sig=abc123&expires=10",
+                status = HttpStatusCode.BadGateway,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Text.Plain.toString()),
+            )
+        }
+
+        val api =
+            KtorOpenAIApi(
+                client,
+                OpenAIApi.Config(
+                    apiKey = "secret",
+                    includeBodySamplesInExceptions = true,
+                ),
+            )
+        val error =
+            assertFailsWith<OpenAIApiError.Http> {
+                api.getModel(ModelId("gpt-4.1-mini"))
+            }
+
+        assertEquals(
+            "authorization=Bearer [REDACTED] api_key=[REDACTED] signed_url=[REDACTED]",
+            error.bodySample,
+        )
+        assertTrue(error.message.orEmpty().contains("[REDACTED]"))
+        assertTrue(!error.message.orEmpty().contains("sk-secret"))
+        assertTrue(!error.message.orEmpty().contains("sk-123"))
+        assertTrue(!error.message.orEmpty().contains("abc123"))
     }
 
     @Test
@@ -467,6 +737,41 @@ class OpenAIApiSpec {
     }
 
     @Test
+    fun `chat completion stream parser preserves deprecated function_call deltas`() {
+        val event =
+            parseChatCompletionStreamEvent(
+                ServerSentEvent(
+                    data =
+                        ServerSentEventData(
+                            """
+                            {
+                              "id":"chatcmpl_fc",
+                              "object":"chat.completion.chunk",
+                              "created":1741569952,
+                              "model":"gpt-5.4",
+                              "choices":[
+                                {
+                                  "index":0,
+                                  "delta":{
+                                    "role":"assistant",
+                                    "function_call":{"name":"lookup_weather","arguments":"{"}
+                                  },
+                                  "finish_reason":null
+                                }
+                              ]
+                            }
+                            """.trimIndent(),
+                        ),
+                ),
+            )
+
+        val chunk = (event as ChatCompletionStreamEvent.Chunk).chunk
+        val functionCall = chunk.choices.single().delta?.functionCall
+        assertEquals("lookup_weather", functionCall?.name)
+        assertEquals("{", functionCall?.arguments)
+    }
+
+    @Test
     fun `provider capabilities reflect stateful differences`() {
         assertTrue(OpenAIProvider.OpenAI.capabilities.statefulResponses)
         assertTrue(OpenAIProvider.OpenAI.capabilities.embeddingsApi)
@@ -526,6 +831,45 @@ class OpenAIApiSpec {
         assertTrue(OpenAIProvider.Gemini.capabilities.batchesApi)
         assertTrue(!OpenAIProvider.Anthropic.capabilities.responsesApi)
         assertTrue(OpenAIProvider.Anthropic.capabilities.chatCompletions)
+    }
+
+    @Test
+    fun `responses reject typed builtin tools when provider disables builtin tool support`() {
+        val request =
+            ResponseCreateRequest(
+                model = ModelId("qwen3"),
+                input = ResponseInput.Text("ping"),
+                tools =
+                    listOf(
+                        ResponseTool.WebSearch(),
+                        ResponseTool.Mcp(serverLabel = "docs", serverUrl = "https://mcp.example.com"),
+                    ),
+                toolChoice = ResponseToolChoice.Shell,
+            )
+
+        val error =
+            assertFailsWith<IllegalArgumentException> {
+                request.requireCompatibleWith(OpenAIProvider.Ollama())
+            }
+
+        assertTrue(error.message.orEmpty().contains("ollama"))
+        assertTrue(error.message.orEmpty().contains("web_search"))
+        assertTrue(error.message.orEmpty().contains("mcp"))
+        assertTrue(error.message.orEmpty().contains("shell"))
+    }
+
+    @Test
+    fun `chat completions still allow function and custom tools when provider disables builtin tool support`() {
+        ChatCompletionRequest(
+            model = ModelId("qwen3"),
+            messages = listOf(ChatMessage(role = ChatRole.USER, content = ChatMessageContent.Text("ping"))),
+            tools =
+                listOf(
+                    ResponseTool.Function(name = "lookup_weather"),
+                    ResponseTool.Custom(name = "emit_patch"),
+                ),
+            toolChoice = ResponseToolChoice.NamedFunction("lookup_weather"),
+        ).requireCompatibleWith(OpenAIProvider.Ollama())
     }
 
     @Test
@@ -616,10 +960,14 @@ class OpenAIApiSpec {
             }
 
         assertTrue(error.message.orEmpty().contains("expected text/event-stream"))
+        assertTrue(!error.message.orEmpty().contains("\"content\":\"hi\""))
+        val sample = OpenAIJson.parseToJsonElement(assertNotNull(error.bodySample)).jsonObject
+        assertEquals("chatcmpl_1", sample["id"]?.jsonPrimitive?.content)
+        assertEquals("chat.completion", sample["object"]?.jsonPrimitive?.content)
     }
 
     @Test
-    fun `streamResponse wraps malformed event chunks as parse errors with body sample`() = runTest {
+    fun `streamResponse wraps malformed event chunks as parse errors without leaking body sample by default`() = runTest {
         val client = httpClient {
             respond(
                 content =
@@ -641,7 +989,7 @@ class OpenAIApiSpec {
                     .collectResponseStream()
             }
 
-        assertTrue(error.message.orEmpty().contains("\"response\":\"oops\""))
+        assertTrue(!error.message.orEmpty().contains("\"response\":\"oops\""))
         assertEquals("""{"type":"response.completed","response":"oops"}""", error.bodySample)
     }
 
@@ -662,8 +1010,107 @@ class OpenAIApiSpec {
             events.forEach(::apply)
         }.snapshot()
 
-        assertEquals("Hello world", assembly.outputText)
+        assertEquals(listOf("Hello", " world"), assembly.outputTexts.values.toList())
+        val error = assertFailsWith<IllegalStateException> { assembly.outputText }
+        assertTrue(error.message.orEmpty().contains("outputTexts"))
         assertTrue(assembly.isDone)
+    }
+
+    @Test
+    fun `response stream assembly orders text by output and content index instead of arrival order`() {
+        val assembly =
+            ResponseStreamAccumulator().let { accumulator ->
+                accumulator.apply(
+                    ResponseStreamEvent.OutputTextDone(
+                        itemId = "msg_2",
+                        outputIndex = 1,
+                        contentIndex = 0,
+                        text = "world",
+                    ),
+                )
+                accumulator.apply(
+                    ResponseStreamEvent.OutputTextDone(
+                        itemId = "msg_1",
+                        outputIndex = 0,
+                        contentIndex = 1,
+                        text = "lo ",
+                    ),
+                )
+                accumulator.apply(
+                    ResponseStreamEvent.OutputTextDone(
+                        itemId = "msg_1",
+                        outputIndex = 0,
+                        contentIndex = 0,
+                        text = "Hel",
+                    ),
+                )
+                accumulator.snapshot()
+            }
+
+        assertEquals(listOf("Hel", "lo ", "world"), assembly.outputTexts.values.toList())
+        val error = assertFailsWith<IllegalStateException> { assembly.outputText }
+        assertTrue(error.message.orEmpty().contains("outputTexts"))
+    }
+
+    @Test
+    fun `response stream assembly orders reasoning and audio maps by semantic position instead of arrival order`() {
+        val assembly =
+            ResponseStreamAccumulator().let { accumulator ->
+                accumulator.apply(
+                    ResponseStreamEvent.ReasoningSummaryTextDone(
+                        itemId = "rs_late",
+                        outputIndex = 2,
+                        text = "second",
+                    ),
+                )
+                accumulator.apply(
+                    ResponseStreamEvent.AudioDone(
+                        itemId = "audio_late",
+                        outputIndex = 3,
+                        contentIndex = 1,
+                        audio = "bbb",
+                    ),
+                )
+                accumulator.apply(
+                    ResponseStreamEvent.AudioTranscriptDone(
+                        itemId = "audio_late",
+                        outputIndex = 3,
+                        contentIndex = 1,
+                        transcript = "world",
+                    ),
+                )
+                accumulator.apply(
+                    ResponseStreamEvent.AudioDone(
+                        itemId = "audio_early",
+                        outputIndex = 0,
+                        contentIndex = 0,
+                        audio = "aaa",
+                    ),
+                )
+                accumulator.apply(
+                    ResponseStreamEvent.AudioTranscriptDone(
+                        itemId = "audio_early",
+                        outputIndex = 0,
+                        contentIndex = 0,
+                        transcript = "hello",
+                    ),
+                )
+                accumulator.apply(
+                    ResponseStreamEvent.ReasoningSummaryTextDone(
+                        itemId = "rs_early",
+                        outputIndex = 1,
+                        text = "first",
+                    ),
+                )
+                accumulator.snapshot()
+            }
+
+        assertEquals(listOf("rs_early", "rs_late"), assembly.reasoningSummaryText.keys.toList())
+        assertEquals(listOf("first", "second"), assembly.reasoningSummaryText.values.toList())
+        assertEquals(listOf("audio_early:0", "audio_late:1"), assembly.audioData.keys.toList())
+        assertEquals(listOf("aaa", "bbb"), assembly.audioData.values.toList())
+        assertEquals(listOf("audio_early:0", "audio_late:1"), assembly.audioTranscript.keys.toList())
+        assertEquals(listOf("hello", "world"), assembly.audioTranscript.values.toList())
     }
 
     @Test
@@ -849,6 +1296,43 @@ class OpenAIApiSpec {
     }
 
     @Test
+    fun `json extras reject overriding reserved keys`() {
+        val error =
+            assertFailsWith<IllegalArgumentException> {
+                ResponseCreateRequest(
+                    model = ModelId("gpt-5"),
+                    input = ResponseInput.Text("hello"),
+                    extraBody =
+                        JsonExtras(
+                            buildJsonObject {
+                                put("model", "gpt-override")
+                            },
+                        ),
+                ).toJson()
+            }
+
+        assertTrue(error.message.orEmpty().contains("model"))
+        assertTrue(error.message.orEmpty().contains("override"))
+    }
+
+    @Test
+    fun `json extras still allow non reserved extension keys`() {
+        val json =
+            ResponseCreateRequest(
+                model = ModelId("gpt-5"),
+                input = ResponseInput.Text("hello"),
+                extraBody =
+                    JsonExtras(
+                        buildJsonObject {
+                            put("vendor_extension", "enabled")
+                        },
+                    ),
+            ).toJson()
+
+        assertEquals("enabled", json["vendor_extension"]?.jsonPrimitive?.content)
+    }
+
+    @Test
     fun `responses request supports file and item reference inputs with structured tool outputs`() {
         val request =
             ResponseCreateRequest(
@@ -880,6 +1364,51 @@ class OpenAIApiSpec {
         assertTrue(json.contains("\"file_url\":\"https://example.com/input.pdf\""))
         assertTrue(json.contains("\"filename\":\"input.pdf\""))
         assertTrue(json.contains("\"output\":[{\"type\":\"input_text\",\"text\":\"done\"}]"))
+    }
+
+    @Test
+    fun `function call output rejects both text and structured content`() {
+        val error =
+            assertFailsWith<IllegalArgumentException> {
+                ResponseInputItem.FunctionCallOutput(
+                    callId = ToolCallId("call_2"),
+                    outputText = "done",
+                    outputContent = listOf(ResponseInputContent.InputText("also done")),
+                )
+            }
+
+        assertTrue(error.message.orEmpty().contains("exactly one"))
+    }
+
+    @Test
+    fun `multipart extra fields reject reserved field name collisions`() {
+        val fileError =
+            assertFailsWith<IllegalArgumentException> {
+                FileCreateRequest(
+                    purpose = FilePurpose.ASSISTANTS,
+                    file = BinaryUpload("notes.txt", "hello".encodeToByteArray(), "text/plain"),
+                    extraFields = mapOf("purpose" to "batch"),
+                )
+            }
+        val transcriptionError =
+            assertFailsWith<IllegalArgumentException> {
+                TranscriptionRequest(
+                    file = BinaryUpload("audio.wav", "WAVE".encodeToByteArray(), "audio/wav"),
+                    model = ModelId("gpt-4o-transcribe"),
+                    extraFields = mapOf("stream" to "true"),
+                )
+            }
+        val imageError =
+            assertFailsWith<IllegalArgumentException> {
+                ImageVariationRequest(
+                    image = BinaryUpload("image.png", "PNG".encodeToByteArray(), "image/png"),
+                    extraFields = mapOf("image" to "override"),
+                )
+            }
+
+        assertTrue(fileError.message.orEmpty().contains("purpose"))
+        assertTrue(transcriptionError.message.orEmpty().contains("stream"))
+        assertTrue(imageError.message.orEmpty().contains("image"))
     }
 
     @Test
@@ -972,6 +1501,27 @@ class OpenAIApiSpec {
         assertTrue(json.contains("\"tool_choice\":{\"type\":\"apply_patch\"}"))
         assertEquals("shell", ResponseToolChoice.Shell.toJson().jsonObject["type"]?.jsonPrimitive?.content)
         assertEquals("custom", ResponseToolChoice.Custom("patch").toJson().jsonObject["type"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `responses reject chat only allowed_tools tool choice`() {
+        val error =
+            assertFailsWith<IllegalArgumentException> {
+                ResponseCreateRequest(
+                    model = ModelId("gpt-5"),
+                    input = ResponseInput.Text("hello"),
+                    toolChoice =
+                        ResponseToolChoice.AllowedTools(
+                            mode = ResponseToolChoice.AllowedTools.Mode.AUTO,
+                            tools =
+                                listOf(
+                                    ResponseTool.Function(name = "get_weather"),
+                                ),
+                        ),
+                )
+            }
+
+        assertTrue(error.message.orEmpty().contains("chat completions"))
     }
 
     @Test
@@ -1521,6 +2071,23 @@ class OpenAIApiSpec {
     }
 
     @Test
+    fun `openrouter request options reject provider and provider routing together`() {
+        val error =
+            assertFailsWith<IllegalArgumentException> {
+                OpenRouterRequestOptions(
+                    provider =
+                        buildJsonObject {
+                            put("require_parameters", true)
+                        },
+                    providerRouting = OpenRouterProviderRouting(order = listOf("openai")),
+                )
+            }
+
+        assertTrue(error.message.orEmpty().contains("provider"))
+        assertTrue(error.message.orEmpty().contains("providerRouting"))
+    }
+
+    @Test
     fun `ollama request options are merged into request body`() = runTest {
         var seenRequest: HttpRequestData? = null
         val client = httpClient { request ->
@@ -1577,6 +2144,7 @@ class OpenAIApiSpec {
         val client = httpClient { request ->
             assertEquals(HttpMethod.Post, request.method)
             assertEquals("/v1/responses/resp_123/cancel", request.url.encodedPath)
+            assertEquals("{}", request.bodyText())
             respondJson("""{"id":"resp_123","object":"response","status":"cancelled","output":[]}""")
         }
 
@@ -2171,6 +2739,123 @@ class OpenAIApiSpec {
     }
 
     @Test
+    fun `chat completion decodes official create example`() {
+        val response =
+            OpenAIJson.decodeFromString<ChatCompletionResponse>(
+                DocumentedChatCompletionCreateExampleJson,
+            )
+
+        assertEquals("chatcmpl-B9MBs8CjcvOU2jLn4n570S5qMJKcT", response.id)
+        assertEquals("chat.completion", response.objectType)
+        assertEquals("gpt-5.4", response.model)
+        assertEquals("Hello! How can I assist you today?", response.outputText())
+        assertEquals(19, response.usage?.promptTokens)
+        assertEquals(10, response.usage?.completionTokens)
+    }
+
+    @Test
+    fun `chat completions audio output fields encode and audio responses decode`() = runTest {
+        var seenRequest: HttpRequestData? = null
+        val client = httpClient { request ->
+            seenRequest = request
+            respondJson(
+                """
+                {
+                  "id": "chatcmpl_audio",
+                  "object": "chat.completion",
+                  "model": "gpt-5.4-mini",
+                  "choices": [
+                    {
+                      "index": 0,
+                      "message": {
+                        "role": "assistant",
+                        "content": "Hello from audio",
+                        "audio": {
+                          "id": "audio_123",
+                          "data": "QUJD",
+                          "expires_at": 1712699999,
+                          "transcript": "Hello from audio"
+                        }
+                      },
+                      "finish_reason": "stop"
+                    }
+                  ]
+                }
+                """.trimIndent(),
+            )
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        val response =
+            api.createChatCompletion(
+                ChatCompletionRequest(
+                    model = ModelId("gpt-5.4-mini"),
+                    messages = listOf(ChatMessage(role = ChatRole.USER, content = ChatMessageContent.Text("ping"))),
+                    modalities = listOf(ChatCompletionModality.TEXT, ChatCompletionModality.AUDIO),
+                    audio =
+                        ChatCompletionAudioConfig(
+                            format = ChatCompletionAudioFormat.MP3,
+                            voice = SpeechVoice.Custom("voice_1234"),
+                        ),
+                ),
+            )
+
+        val body = assertNotNull(seenRequest).bodyText()
+        assertTrue(body.contains("\"modalities\":[\"text\",\"audio\"]"))
+        assertTrue(body.contains("\"audio\":{\"format\":\"mp3\",\"voice\":{\"id\":\"voice_1234\"}}"))
+
+        val audio = response.audioOutputs().single()
+        assertEquals("audio_123", audio.id)
+        assertEquals("QUJD", audio.data)
+        assertEquals(1712699999L, audio.expiresAt)
+        assertEquals("Hello from audio", audio.transcript)
+        assertEquals(listOf("Hello from audio"), response.audioTranscripts())
+    }
+
+    @Test
+    fun `assistant chat message audio continuation serializes current shape`() {
+        val message =
+            ChatMessage(
+                role = ChatRole.ASSISTANT,
+                content = ChatMessageContent.Text("Continue"),
+                audio = ChatMessageAudioReference("audio_prev"),
+            )
+
+        val json = message.toJson().toString()
+
+        assertTrue(json.contains("\"role\":\"assistant\""))
+        assertTrue(json.contains("\"audio\":{\"id\":\"audio_prev\"}"))
+    }
+
+    @Test
+    fun `chat completion audio output config requires matching modality`() {
+        val missingModality =
+            assertFailsWith<IllegalArgumentException> {
+                ChatCompletionRequest(
+                    model = ModelId("gpt-5.4-mini"),
+                    messages = listOf(ChatMessage(role = ChatRole.USER, content = ChatMessageContent.Text("ping"))),
+                    audio =
+                        ChatCompletionAudioConfig(
+                            format = ChatCompletionAudioFormat.WAV,
+                            voice = SpeechVoice.BuiltIn("alloy"),
+                        ),
+                )
+            }
+
+        val missingConfig =
+            assertFailsWith<IllegalArgumentException> {
+                ChatCompletionRequest(
+                    model = ModelId("gpt-5.4-mini"),
+                    messages = listOf(ChatMessage(role = ChatRole.USER, content = ChatMessageContent.Text("ping"))),
+                    modalities = listOf(ChatCompletionModality.AUDIO),
+                )
+            }
+
+        assertTrue(missingModality.message.orEmpty().contains("modalities"))
+        assertTrue(missingConfig.message.orEmpty().contains("audio output config"))
+    }
+
+    @Test
     fun `chat completion function tools serialize nested function envelope`() = runTest {
         var seenRequest: HttpRequestData? = null
         val client = httpClient { request ->
@@ -2212,6 +2897,151 @@ class OpenAIApiSpec {
 
         assertEquals("function", toolChoice["type"]?.jsonPrimitive?.content)
         assertEquals("get_weather", toolChoice["function"]?.jsonObject?.get("name")?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `chat completion custom tools serialize nested custom envelope and decode custom tool calls`() = runTest {
+        var seenRequest: HttpRequestData? = null
+        val client = httpClient { request ->
+            seenRequest = request
+            respondJson(
+                """
+                {
+                  "id":"chatcmpl_custom",
+                  "object":"chat.completion",
+                  "choices":[
+                    {
+                      "index":0,
+                      "message":{
+                        "role":"assistant",
+                        "tool_calls":[
+                          {
+                            "id":"call_custom",
+                            "type":"custom",
+                            "custom":{"name":"run_macro","input":"open settings"}
+                          }
+                        ]
+                      },
+                      "finish_reason":"tool_calls"
+                    }
+                  ]
+                }
+                """.trimIndent(),
+            )
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        val response =
+            api.createChatCompletion(
+                ChatCompletionRequest(
+                    model = ModelId("gpt-5.4-mini"),
+                    messages = listOf(ChatMessage(role = ChatRole.USER, content = ChatMessageContent.Text("ping"))),
+                    tools =
+                        listOf(
+                            ResponseTool.Custom(
+                                name = "run_macro",
+                                description = "Execute a macro",
+                            ),
+                        ),
+                    toolChoice = ResponseToolChoice.Custom("run_macro"),
+                ),
+            )
+
+        val payload = OpenAIJson.parseToJsonElement(assertNotNull(seenRequest).bodyText()).jsonObject
+        val tool = payload["tools"]!!.jsonArray.single().jsonObject
+        val toolChoice = payload["tool_choice"]!!.jsonObject
+        val call = response.toolCalls().single()
+
+        assertEquals("custom", tool["type"]?.jsonPrimitive?.content)
+        assertEquals("run_macro", tool["custom"]?.jsonObject?.get("name")?.jsonPrimitive?.content)
+        assertEquals("Execute a macro", tool["custom"]?.jsonObject?.get("description")?.jsonPrimitive?.content)
+        assertTrue(tool["name"] == null)
+        assertTrue(tool["description"] == null)
+
+        assertEquals("custom", toolChoice["type"]?.jsonPrimitive?.content)
+        assertEquals("run_macro", toolChoice["custom"]?.jsonObject?.get("name")?.jsonPrimitive?.content)
+
+        assertEquals(ChatCompletionToolCallType.Custom, call.type)
+        assertEquals("run_macro", call.custom?.name)
+        assertEquals("open settings", call.custom?.input)
+    }
+
+    @Test
+    fun `chat completion allowed tools tool choice serializes current shape`() {
+        val request =
+            ChatCompletionRequest(
+                model = ModelId("gpt-5.4-mini"),
+                messages = listOf(ChatMessage(role = ChatRole.USER, content = ChatMessageContent.Text("ping"))),
+                toolChoice =
+                    ResponseToolChoice.AllowedTools(
+                        mode = ResponseToolChoice.AllowedTools.Mode.REQUIRED,
+                        tools =
+                            listOf(
+                                ResponseTool.Function(name = "get_weather"),
+                                ResponseTool.Custom(name = "run_macro"),
+                            ),
+                    ),
+            )
+
+        val payload = request.toJson()
+        val toolChoice = payload["tool_choice"]!!.jsonObject
+        val allowedTools = toolChoice["allowed_tools"]!!.jsonObject
+        val tools = allowedTools["tools"]!!.jsonArray
+
+        assertEquals("allowed_tools", toolChoice["type"]?.jsonPrimitive?.content)
+        assertEquals("required", allowedTools["mode"]?.jsonPrimitive?.content)
+        assertEquals("function", tools[0].jsonObject["type"]?.jsonPrimitive?.content)
+        assertEquals("get_weather", tools[0].jsonObject["function"]?.jsonObject?.get("name")?.jsonPrimitive?.content)
+        assertEquals("custom", tools[1].jsonObject["type"]?.jsonPrimitive?.content)
+        assertEquals("run_macro", tools[1].jsonObject["custom"]?.jsonObject?.get("name")?.jsonPrimitive?.content)
+        assertTrue(payload["tools"] == null)
+    }
+
+    @Test
+    fun `chat completion allowed tools reject conflicting top level tools and unsupported types`() {
+        val conflicting =
+            assertFailsWith<IllegalArgumentException> {
+                ChatCompletionRequest(
+                    model = ModelId("gpt-5.4-mini"),
+                    messages = listOf(ChatMessage(role = ChatRole.USER, content = ChatMessageContent.Text("ping"))),
+                    tools = listOf(ResponseTool.Function(name = "duplicate")),
+                    toolChoice =
+                        ResponseToolChoice.AllowedTools(
+                            mode = ResponseToolChoice.AllowedTools.Mode.AUTO,
+                            tools = listOf(ResponseTool.Function(name = "get_weather")),
+                        ),
+                )
+            }
+        assertTrue(conflicting.message.orEmpty().contains("top-level tools"))
+
+        val unsupported =
+            assertFailsWith<IllegalArgumentException> {
+                ChatCompletionRequest(
+                    model = ModelId("gpt-5.4-mini"),
+                    messages = listOf(ChatMessage(role = ChatRole.USER, content = ChatMessageContent.Text("ping"))),
+                    toolChoice =
+                        ResponseToolChoice.AllowedTools(
+                            mode = ResponseToolChoice.AllowedTools.Mode.AUTO,
+                            tools = listOf(ResponseTool.LocalShell),
+                        ),
+                )
+            }
+        assertTrue(unsupported.message.orEmpty().contains("allowed_tools"))
+    }
+
+    @Test
+    fun `chat function role serializes with required name`() {
+        val message =
+            ChatMessage(
+                role = ChatRole.FUNCTION,
+                name = "get_weather",
+                content = ChatMessageContent.Text("""{"temp_c":21}"""),
+            )
+
+        val json = message.toJson().toString()
+
+        assertTrue(json.contains("\"role\":\"function\""))
+        assertTrue(json.contains("\"name\":\"get_weather\""))
     }
 
     @Test
@@ -2350,7 +3180,7 @@ class OpenAIApiSpec {
         assertFailsWith<IllegalArgumentException> {
             VectorStoreFileCreateRequest(
                 fileId = FileId("file_1"),
-                attributes = mapOf("" to "value"),
+                attributes = VectorStoreAttributes.of("" to "value"),
             )
         }
     }
@@ -2374,6 +3204,16 @@ class OpenAIApiSpec {
         assertFailsWith<IllegalArgumentException> {
             EvalCreateRequest(
                 name = "eval-1",
+                dataSourceConfig =
+                    buildJsonObject {
+                        put("type", "stored_completions")
+                    },
+                testingCriteria =
+                    listOf(
+                        buildJsonObject {
+                            put("type", "label_model")
+                        },
+                    ),
                 metadata = mapOf("" to "value"),
             )
         }
@@ -2531,6 +3371,108 @@ class OpenAIApiSpec {
         assertEquals("""{"city":"Paris"}""", assembly.toolCallArguments["call_1"])
         assertEquals(ChatCompletionFinishReason.ToolCalls, assembly.finishReasons[0])
         assertTrue(assembly.isDone)
+    }
+
+    @Test
+    fun `chat completion stream assembly orders text and reasoning by choice index instead of arrival order`() {
+        val assembly =
+            ChatCompletionStreamAccumulator().let { accumulator ->
+                accumulator.apply(
+                    ChatCompletionStreamEvent.Chunk(
+                        ChatCompletionChunk(
+                            id = "chatcmpl_order",
+                            choices =
+                                listOf(
+                                    ChatCompletionChunkChoice(
+                                        index = 1,
+                                        delta = ChatCompletionChunkDelta(content = "world", reasoningContent = "second"),
+                                    ),
+                                ),
+                        ),
+                    ),
+                )
+                accumulator.apply(
+                    ChatCompletionStreamEvent.Chunk(
+                        ChatCompletionChunk(
+                            id = "chatcmpl_order",
+                            choices =
+                                listOf(
+                                    ChatCompletionChunkChoice(
+                                        index = 0,
+                                        delta = ChatCompletionChunkDelta(content = "Hello ", reasoningContent = "first"),
+                                    ),
+                                ),
+                        ),
+                    ),
+                )
+                accumulator.snapshot()
+            }
+
+        assertEquals(listOf(0, 1), assembly.choiceTexts.keys.toList())
+        assertEquals(listOf("Hello ", "world"), assembly.choiceTexts.values.toList())
+        assertEquals(listOf("first", "second"), assembly.choiceReasoningContents.values.toList())
+        val textError = assertFailsWith<IllegalStateException> { assembly.outputText }
+        assertTrue(textError.message.orEmpty().contains("choiceTexts"))
+        val reasoningError = assertFailsWith<IllegalStateException> { assembly.reasoningContent }
+        assertTrue(reasoningError.message.orEmpty().contains("choiceReasoningContents"))
+    }
+
+    @Test
+    fun `chat completion stream assembly accumulates deprecated function_call arguments`() {
+        val assembly =
+            ChatCompletionStreamAccumulator().let { accumulator ->
+                accumulator.apply(
+                    ChatCompletionStreamEvent.Chunk(
+                        OpenAIJson.decodeFromString(
+                            """
+                            {
+                              "id":"chatcmpl_fc",
+                              "object":"chat.completion.chunk",
+                              "created":1741569952,
+                              "model":"gpt-5.4",
+                              "choices":[
+                                {
+                                  "index":0,
+                                  "delta":{
+                                    "role":"assistant",
+                                    "function_call":{"name":"lookup_weather","arguments":"{"}
+                                  },
+                                  "finish_reason":null
+                                }
+                              ]
+                            }
+                            """.trimIndent(),
+                        ),
+                    ),
+                )
+                accumulator.apply(
+                    ChatCompletionStreamEvent.Chunk(
+                        OpenAIJson.decodeFromString(
+                            """
+                            {
+                              "id":"chatcmpl_fc",
+                              "object":"chat.completion.chunk",
+                              "created":1741569952,
+                              "model":"gpt-5.4",
+                              "choices":[
+                                {
+                                  "index":0,
+                                  "delta":{
+                                    "function_call":{"arguments":"\"city\":\"Paris\"}"}
+                                  },
+                                  "finish_reason":"function_call"
+                                }
+                              ]
+                            }
+                            """.trimIndent(),
+                        ),
+                    ),
+                )
+                accumulator.snapshot()
+            }
+
+        assertEquals("""{"city":"Paris"}""", assembly.toolCallArguments["choice:0:function_call"])
+        assertEquals(ChatCompletionFinishReason.FunctionCall, assembly.finishReasons[0])
     }
 
     @Test
@@ -3972,6 +4914,40 @@ class OpenAIApiSpec {
     }
 
     @Test
+    fun `createTranscription accepts streaming binary upload`() = runTest {
+        var seenRequest: HttpRequestData? = null
+        val client = httpClient { request ->
+            seenRequest = request
+            assertEquals(HttpMethod.Post, request.method)
+            assertEquals("/v1/audio/transcriptions", request.url.encodedPath)
+            respondJson("""{"text":"hello stream","language":"en","duration":1.2,"response_format":"json"}""")
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        val result =
+            api.createTranscription(
+                StreamingTranscriptionRequest(
+                    file =
+                        StreamingBinaryUpload(
+                            filename = "clip.wav",
+                            sizeBytes = 4,
+                            contentType = "audio/wav",
+                        ) { ByteReadChannel("WAVE".encodeToByteArray()) },
+                    model = ModelId("gpt-4o-mini-transcribe"),
+                    responseFormat = AudioTextResponseFormat.JSON,
+                ),
+            )
+
+        assertEquals("hello stream", result.text)
+        val request = assertNotNull(seenRequest)
+        assertTrue((request.body.contentType?.toString() ?: "").startsWith("multipart/form-data"))
+        val body = request.bodyText()
+        assertTrue(body.contains("clip.wav"))
+        assertTrue(body.contains("WAVE"))
+        assertTrue(body.contains("gpt-4o-mini-transcribe"))
+    }
+
+    @Test
     fun `streamTranscription sends stream flag and parses transcript events`() = runTest {
         var seenRequest: HttpRequestData? = null
         val client = httpClient { request ->
@@ -4117,6 +5093,89 @@ class OpenAIApiSpec {
     }
 
     @Test
+    fun `transcription explicit non diarized response format keeps regular segments even with string ids`() {
+        val result =
+            OpenAIJson.decodeFromString<TranscriptionResult>(
+                """
+                {
+                  "text":"hello there",
+                  "response_format":"json",
+                  "segments":[
+                    {
+                      "id":"seg_compat_1",
+                      "type":"transcript.text.segment",
+                      "start":0.0,
+                      "end":1.2,
+                      "speaker":"agent",
+                      "text":"hello there"
+                    }
+                  ]
+                }
+                """.trimIndent(),
+            )
+
+        assertEquals(TranscriptionSegmentIdValue.Text("seg_compat_1"), result.segments.single().id)
+        assertEquals("agent", result.segments.single().speaker)
+        assertTrue(result.diarizedSegments.isEmpty())
+    }
+
+    @Test
+    fun `transcription without response format falls back to diarized segments for speaker tagged string ids`() {
+        val result =
+            OpenAIJson.decodeFromString<TranscriptionResult>(
+                """
+                {
+                  "text":"hello there",
+                  "segments":[
+                    {
+                      "id":"seg_compat_2",
+                      "type":"transcript.text.segment",
+                      "start":0.0,
+                      "end":1.2,
+                      "speaker":"customer",
+                      "text":"hello there"
+                    }
+                  ]
+                }
+                """.trimIndent(),
+            )
+
+        assertEquals("seg_compat_2", result.diarizedSegments.single().id)
+        assertEquals("customer", result.diarizedSegments.single().speaker)
+        assertTrue(result.segments.isEmpty())
+    }
+
+    @Test
+    fun `transcription without response format falls back to regular segments for provider style string ids with regular metrics`() {
+        val result =
+            OpenAIJson.decodeFromString<TranscriptionResult>(
+                """
+                {
+                  "text":"hello there",
+                  "segments":[
+                    {
+                      "id":"seg_compat_3",
+                      "start":0.0,
+                      "end":1.2,
+                      "text":"hello there",
+                      "avg_logprob":-0.1,
+                      "compression_ratio":1.1,
+                      "no_speech_prob":0.02,
+                      "seek":0,
+                      "temperature":0.0,
+                      "tokens":[1,2,3]
+                    }
+                  ]
+                }
+                """.trimIndent(),
+            )
+
+        assertEquals(TranscriptionSegmentIdValue.Text("seg_compat_3"), result.segments.single().id)
+        assertEquals(-0.1, result.segments.single().avgLogprob)
+        assertTrue(result.diarizedSegments.isEmpty())
+    }
+
+    @Test
     fun `uploadFile sends multipart file upload`() = runTest {
         var seenRequest: HttpRequestData? = null
         val client = httpClient { request ->
@@ -4145,6 +5204,92 @@ class OpenAIApiSpec {
     }
 
     @Test
+    fun `uploadFile accepts streaming binary upload`() = runTest {
+        var seenRequest: HttpRequestData? = null
+        val client = httpClient { request ->
+            seenRequest = request
+            assertEquals(HttpMethod.Post, request.method)
+            assertEquals("/v1/files", request.url.encodedPath)
+            respondJson("""{"id":"file_stream","object":"file","filename":"notes.txt","purpose":"assistants"}""")
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        val file =
+            api.uploadFile(
+                StreamingFileCreateRequest(
+                    purpose = FilePurpose.ASSISTANTS,
+                    file =
+                        StreamingBinaryUpload(
+                            filename = "notes.txt",
+                            sizeBytes = 5,
+                            contentType = "text/plain",
+                        ) { ByteReadChannel("hello".encodeToByteArray()) },
+                ),
+            )
+
+        assertEquals("file_stream", file.id)
+        val request = assertNotNull(seenRequest)
+        assertTrue((request.body.contentType?.toString() ?: "").startsWith("multipart/form-data"))
+        val body = request.bodyText()
+        assertTrue(body.contains("assistants"))
+        assertTrue(body.contains("notes.txt"))
+        assertTrue(body.contains("hello"))
+    }
+
+    @Test
+    fun `addUploadPart accepts streaming binary upload`() = runTest {
+        var seenRequest: HttpRequestData? = null
+        val client = httpClient { request ->
+            seenRequest = request
+            assertEquals(HttpMethod.Post, request.method)
+            assertEquals("/v1/uploads/upload_123/parts", request.url.encodedPath)
+            respondJson("""{"id":"part_1","object":"upload.part"}""")
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        val part =
+            api.addUploadPart(
+                UploadId("upload_123"),
+                StreamingBinaryUpload(
+                    filename = "chunk.bin",
+                    sizeBytes = 5,
+                    contentType = "application/octet-stream",
+                ) { ByteReadChannel("abcde".encodeToByteArray()) },
+            )
+
+        assertEquals("part_1", part.id)
+        val request = assertNotNull(seenRequest)
+        assertTrue((request.body.contentType?.toString() ?: "").startsWith("multipart/form-data"))
+        val body = request.bodyText()
+        assertTrue(body.contains("chunk.bin"))
+        assertTrue(body.contains("abcde"))
+    }
+
+    @Test
+    fun `uploadFile sanitizes multipart filename metadata`() = runTest {
+        var seenRequest: HttpRequestData? = null
+        val client = httpClient { request ->
+            seenRequest = request
+            assertEquals(HttpMethod.Post, request.method)
+            assertEquals("/v1/files", request.url.encodedPath)
+            respondJson("""{"id":"file_123","object":"file","filename":"bad_name_.txt","purpose":"assistants"}""")
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        api.uploadFile(
+            FileCreateRequest(
+                purpose = FilePurpose.ASSISTANTS,
+                file = BinaryUpload("..\\private\\bad\r\n\"name\u0000.txt", "hello".encodeToByteArray(), "text/plain"),
+            ),
+        )
+
+        val body = assertNotNull(seenRequest).bodyText()
+        assertTrue(body.contains("""filename="bad_name_.txt""""))
+        assertFalse(body.contains("..\\private\\"))
+        assertFalse(body.contains('\u0000'))
+    }
+
+    @Test
     fun `downloadFile decodes typed api errors even on binary endpoint`() = runTest {
         val client = httpClient { request ->
             assertEquals(HttpMethod.Get, request.method)
@@ -4165,6 +5310,41 @@ class OpenAIApiSpec {
         assertEquals(404, error.status)
         assertEquals("invalid_request_error", error.error.type)
         assertEquals(ResponseErrorCode.Unknown("file_not_found"), error.error.code)
+    }
+
+    @Test
+    fun `downloadFileTo streams content and bypasses eager size guard`() = runTest {
+        val client = httpClient { request ->
+            assertEquals(HttpMethod.Get, request.method)
+            assertEquals("/v1/files/file_big/content", request.url.encodedPath)
+            respond(
+                content = "TOO-LARGE",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "application/octet-stream"),
+            )
+        }
+
+        val api =
+            KtorOpenAIApi(
+                client,
+                OpenAIApi.Config(
+                    apiKey = "secret",
+                    maxEagerBinaryBytes = 4,
+                ),
+            )
+
+        val error =
+            assertFailsWith<IllegalStateException> {
+                api.downloadFile(FileId("file_big"))
+            }
+        assertTrue(error.message.orEmpty().contains("maxEagerBinaryBytes"))
+
+        val chunks = mutableListOf<ByteArray>()
+        api.downloadFileTo(FileId("file_big")) { chunk ->
+            chunks += chunk
+        }
+
+        assertEquals("TOO-LARGE", chunks.concatByteArrays().decodeToString())
     }
 
     @Test
@@ -4623,6 +5803,47 @@ class OpenAIApiSpec {
     }
 
     @Test
+    fun `chat completion helpers expose structured choice texts and reject merged multi choice output`() {
+        val response =
+            ChatCompletionResponse(
+                id = "chatcmpl_multi",
+                choices =
+                    listOf(
+                        ChatCompletionChoice(
+                            index = 0,
+                            message =
+                                ChatCompletionMessageObject(
+                                    role = "assistant",
+                                    content = """{"city":"Paris"}""",
+                                    reasoningContent = "first",
+                                ),
+                        ),
+                        ChatCompletionChoice(
+                            index = 1,
+                            message =
+                                ChatCompletionMessageObject(
+                                    role = "assistant",
+                                    content = """{"city":"Tokyo"}""",
+                                    reasoningContent = "second",
+                                ),
+                        ),
+                    ),
+            )
+
+        assertEquals(listOf("""{"city":"Paris"}""", """{"city":"Tokyo"}"""), response.choiceTexts())
+        assertEquals(listOf("first", "second"), response.choiceReasoningContents())
+
+        val textError = assertFailsWith<IllegalStateException> { response.outputText() }
+        assertTrue(textError.message.orEmpty().contains("choiceTexts()"))
+
+        val reasoningError = assertFailsWith<IllegalStateException> { response.reasoningContent() }
+        assertTrue(reasoningError.message.orEmpty().contains("choiceReasoningContents()"))
+
+        val jsonError = assertFailsWith<IllegalStateException> { response.outputJsonElementOrNull() }
+        assertTrue(jsonError.message.orEmpty().contains("choiceTexts()"))
+    }
+
+    @Test
     fun `deepseek streaming accumulates reasoning content deltas`() = runTest {
         val client = httpClient {
             respond(
@@ -4880,19 +6101,24 @@ class OpenAIApiSpec {
     @Test
     fun `stored chat completion lifecycle endpoints work`() = runTest {
         val seenPaths = mutableListOf<String>()
+        val seenBodies = mutableListOf<String>()
         val client = httpClient { request ->
             seenPaths += request.url.encodedPath
+            seenBodies += request.bodyText()
             when (request.url.encodedPath) {
                 "/v1/chat/completions/chat_1" ->
-                    if (request.method == HttpMethod.Get) {
-                        respondJson("""{"id":"chat_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}]}""")
-                    } else {
-                        respondJson("""{"id":"chat_1","object":"chat.completion.deleted","deleted":true}""")
+                    when (request.method) {
+                        HttpMethod.Get ->
+                            respondJson(DocumentedStoredChatCompletionGetJson)
+                        HttpMethod.Post ->
+                            respondJson(DocumentedStoredChatCompletionUpdateJson)
+                        else ->
+                            respondJson(DocumentedStoredChatCompletionDeleteJson)
                     }
                 "/v1/chat/completions" ->
-                    respondJson("""{"object":"list","data":[{"id":"chat_1","object":"chat.completion","choices":[]}],"has_more":false}""")
+                    respondJson(DocumentedStoredChatCompletionListJson)
                 "/v1/chat/completions/chat_1/messages" ->
-                    respondJson("""{"object":"list","data":[{"role":"assistant","content":"hi"}],"has_more":false}""")
+                    respondJson(DocumentedStoredChatCompletionMessagesJson)
                 else -> error("unexpected path ${request.url.encodedPath}")
             }
         }
@@ -4901,17 +6127,27 @@ class OpenAIApiSpec {
         val item = api.getStoredChatCompletion(ChatCompletionId("chat_1"))
         val page = api.listStoredChatCompletions()
         val messages = api.listStoredChatCompletionMessages(ChatCompletionId("chat_1"))
+        val updated =
+            api.updateStoredChatCompletion(
+                ChatCompletionId("chat_1"),
+                StoredChatCompletionUpdateRequest(metadata = mapOf("foo" to "bar")),
+            )
         val deleted = api.deleteStoredChatCompletion(ChatCompletionId("chat_1"))
 
-        assertEquals("chat_1", item.id)
-        assertEquals("chat_1", page.data.single().id)
-        assertEquals("assistant", messages.data.single().role)
+        assertEquals("chatcmpl-abc123", item.id)
+        assertEquals("chatcmpl-AyPNinnUqUDYo9SAdA52NobMflmj2", page.data.single().id)
+        assertEquals("chatcmpl-AyPNinnUqUDYo9SAdA52NobMflmj2-0", messages.firstId)
+        assertEquals("user", messages.data.single().role)
+        assertEquals("chatcmpl-AyPNinnUqUDYo9SAdA52NobMflmj2", updated.id)
+        assertEquals("Mind of circuits hum,  \nLearning patterns in silence—  \nFuture's quiet spark.", item.outputText())
         assertTrue(deleted.deleted)
+        assertTrue(seenBodies[3].contains("\"metadata\":{\"foo\":\"bar\"}"))
         assertEquals(
             listOf(
                 "/v1/chat/completions/chat_1",
                 "/v1/chat/completions",
                 "/v1/chat/completions/chat_1/messages",
+                "/v1/chat/completions/chat_1",
                 "/v1/chat/completions/chat_1",
             ),
             seenPaths,
@@ -5066,7 +6302,7 @@ class OpenAIApiSpec {
                 VectorStoreId("vs_1"),
                 VectorStoreFileBatchCreateRequest(
                     fileIds = listOf(FileId("file_1"), FileId("file_2")),
-                    attributes = mapOf("team" to "search"),
+                    attributes = VectorStoreAttributes.of("team" to "search"),
                     chunkingStrategy =
                         VectorStoreChunkingStrategy.Static(
                             config = VectorStoreStaticChunking(maxChunkSizeTokens = 800, chunkOverlapTokens = 400),
@@ -5090,7 +6326,124 @@ class OpenAIApiSpec {
                 "\"chunking_strategy\":{\"type\":\"static\",\"static\":{\"max_chunk_size_tokens\":800,\"chunk_overlap_tokens\":400}}",
             ),
         )
+        assertEquals("{}", seenBodies.last())
         assertTrue(betaHeaders.all { it == "assistants=v2" })
+    }
+
+    @Test
+    fun `vector store file requests encode primitive attributes and per-file batch payloads`() = runTest {
+        val seenPaths = mutableListOf<String>()
+        val seenBodies = mutableListOf<String>()
+        val client = httpClient { request ->
+            seenPaths += request.url.encodedPath
+            seenBodies += request.bodyText()
+            when (request.url.encodedPath) {
+                "/v1/vector_stores/vs_1/files" ->
+                    respondJson(
+                        """{"id":"file_1","object":"vector_store.file","vector_store_id":"vs_1","status":"completed","attributes":{"team":"search","rank":7,"active":true}}""",
+                    )
+                "/v1/vector_stores/vs_1/files/file_1" ->
+                    respondJson(
+                        """{"id":"file_1","object":"vector_store.file","vector_store_id":"vs_1","status":"completed","attributes":{"team":"ml","priority":2,"indexed":false}}""",
+                    )
+                "/v1/vector_stores/vs_1/file_batches" ->
+                    respondJson(
+                        """{"id":"vsfb_1","object":"vector_store.file_batch","vector_store_id":"vs_1","status":"in_progress"}""",
+                    )
+                else -> error("unexpected path ${request.url.encodedPath}")
+            }
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        val created =
+            api.createVectorStoreFile(
+                VectorStoreId("vs_1"),
+                VectorStoreFileCreateRequest(
+                    fileId = FileId("file_1"),
+                    attributes = VectorStoreAttributes.of("team" to "search", "rank" to 7, "active" to true),
+                ),
+            )
+        val updated =
+            api.updateVectorStoreFile(
+                VectorStoreId("vs_1"),
+                FileId("file_1"),
+                VectorStoreFileUpdateRequest(
+                    attributes = VectorStoreAttributes.of("team" to "ml", "priority" to 2, "indexed" to false),
+                ),
+            )
+        val batch =
+            api.createVectorStoreFileBatch(
+                VectorStoreId("vs_1"),
+                VectorStoreFileBatchCreateRequest(
+                    files =
+                        listOf(
+                            VectorStoreFileBatchInput(
+                                fileId = FileId("file_1"),
+                                attributes = VectorStoreAttributes.of("category" to "finance", "priority" to 1),
+                            ),
+                            VectorStoreFileBatchInput(
+                                fileId = FileId("file_2"),
+                                attributes = VectorStoreAttributes.of("active" to true),
+                                chunkingStrategy =
+                                    VectorStoreChunkingStrategy.Static(
+                                        config = VectorStoreStaticChunking(maxChunkSizeTokens = 800, chunkOverlapTokens = 400),
+                                    ),
+                            ),
+                        ),
+                ),
+            )
+
+        assertEquals("search", created.attributes?.get("team")?.jsonPrimitive?.content)
+        assertEquals(7, created.attributes?.get("rank")?.jsonPrimitive?.intOrNull)
+        assertTrue(created.attributes?.get("active")?.jsonPrimitive?.booleanOrNull == true)
+        assertEquals(2, updated.attributes?.get("priority")?.jsonPrimitive?.intOrNull)
+        assertTrue(updated.attributes?.get("indexed")?.jsonPrimitive?.booleanOrNull == false)
+        assertEquals("vsfb_1", batch.id)
+        assertEquals(
+            """{"file_id":"file_1","attributes":{"team":"search","rank":7,"active":true}}""",
+            seenBodies[0],
+        )
+        assertEquals(
+            """{"attributes":{"team":"ml","priority":2,"indexed":false}}""",
+            seenBodies[1],
+        )
+        assertEquals(
+            """{"files":[{"file_id":"file_1","attributes":{"category":"finance","priority":1}},{"file_id":"file_2","attributes":{"active":true},"chunking_strategy":{"type":"static","static":{"max_chunk_size_tokens":800,"chunk_overlap_tokens":400}}}]}""",
+            seenBodies[2],
+        )
+        assertEquals(
+            listOf(
+                "/v1/vector_stores/vs_1/files",
+                "/v1/vector_stores/vs_1/files/file_1",
+                "/v1/vector_stores/vs_1/file_batches",
+            ),
+            seenPaths,
+        )
+    }
+
+    @Test
+    fun `vector store file batch requests reject ambiguous file sources and overrides`() {
+        assertFailsWith<IllegalArgumentException> {
+            VectorStoreFileBatchCreateRequest()
+        }
+        assertFailsWith<IllegalArgumentException> {
+            VectorStoreFileBatchCreateRequest(
+                fileIds = listOf(FileId("file_1")),
+                files = listOf(VectorStoreFileBatchInput(fileId = FileId("file_2"))),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            VectorStoreFileBatchCreateRequest(
+                files = listOf(VectorStoreFileBatchInput(fileId = FileId("file_1"))),
+                attributes = VectorStoreAttributes.of("team" to "search"),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            VectorStoreFileBatchCreateRequest(
+                files = listOf(VectorStoreFileBatchInput(fileId = FileId("file_1"))),
+                chunkingStrategy = VectorStoreChunkingStrategy.Auto,
+            )
+        }
     }
 
     @Test
@@ -5134,10 +6487,7 @@ class OpenAIApiSpec {
                 VectorStoreId("vs_1"),
                 FileId("file_1"),
                 VectorStoreFileUpdateRequest(
-                    attributes =
-                        buildJsonObject {
-                            put("team", "ml")
-                        },
+                    attributes = VectorStoreAttributes.of("team" to "ml"),
                 ),
             )
         val deleted = api.deleteVectorStoreFile(VectorStoreId("vs_1"), FileId("file_1"))
@@ -5579,7 +6929,7 @@ class OpenAIApiSpec {
         assertTrue(acceptBody.contains("\"output_modalities\":[\"audio\"]"))
         assertTrue(!acceptBody.contains("\"session\""))
 
-        assertEquals("", hangupRequest.bodyText())
+        assertEquals("{}", hangupRequest.bodyText())
         assertEquals("{\"target_uri\":\"tel:+14155550123\"}", referRequest.bodyText())
         assertEquals("{\"status_code\":486}", rejectRequest.bodyText())
     }
@@ -5678,14 +7028,30 @@ class OpenAIApiSpec {
                     }
                 "/v1/evals/eval_1/runs" ->
                     if (request.method == HttpMethod.Post) {
-                        respondJson("""{"id":"run_1","object":"eval.run","eval_id":"eval_1","status":"queued"}""")
+                        respondJson(
+                            """
+                            {
+                              "id":"run_1",
+                              "object":"eval.run",
+                              "eval_id":"eval_1",
+                              "status":"queued",
+                              "data_source":{"type":"completions"},
+                              "metadata":{"suite":"smoke"}
+                            }
+                            """.trimIndent(),
+                        )
                     } else {
                         respondJson("""{"object":"list","data":[{"id":"run_1","object":"eval.run","status":"completed"}],"has_more":false}""")
                     }
                 "/v1/evals/eval_1/runs/run_1" ->
                     when (request.method) {
                         HttpMethod.Get -> respondJson("""{"id":"run_1","object":"eval.run","status":"completed"}""")
-                        HttpMethod.Post -> respondJson("""{"id":"run_1","object":"eval.run","name":"rerun"}""")
+                        HttpMethod.Post ->
+                            if (request.bodyText() == "{}") {
+                                respondJson("""{"id":"run_1","object":"eval.run","status":"canceled"}""")
+                            } else {
+                                respondJson("""{"id":"run_1","object":"eval.run","name":"rerun"}""")
+                            }
                         HttpMethod.Delete -> respondJson("""{"id":"run_1","object":"eval.run.deleted","deleted":true}""")
                         else -> error("unexpected method ${request.method}")
                     }
@@ -5696,11 +7062,122 @@ class OpenAIApiSpec {
         }
 
         val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
-        val created = api.createEval(EvalCreateRequest(name = "baseline", metadata = mapOf("suite" to "smoke")))
+        val created =
+            api.createEval(
+                EvalCreateRequest(
+                    name = "baseline",
+                    dataSourceConfig =
+                        buildJsonObject {
+                            put("type", "stored_completions")
+                            put(
+                                "metadata",
+                                buildJsonObject {
+                                    put("usecase", "chatbot")
+                                },
+                            )
+                        },
+                    testingCriteria =
+                        listOf(
+                            buildJsonObject {
+                                put("type", "label_model")
+                                put("model", "o3-mini")
+                                put(
+                                    "input",
+                                    kotlinx.serialization.json.JsonArray(
+                                        listOf(
+                                            buildJsonObject {
+                                                put("role", "developer")
+                                                put("content", "Classify sentiment")
+                                            },
+                                            buildJsonObject {
+                                                put("role", "user")
+                                                put("content", "Statement: {{item.input}}")
+                                            },
+                                        ),
+                                    ),
+                                )
+                                put(
+                                    "passing_labels",
+                                    kotlinx.serialization.json.JsonArray(listOf(JsonPrimitive("positive"))),
+                                )
+                                put(
+                                    "labels",
+                                    kotlinx.serialization.json.JsonArray(
+                                        listOf(
+                                            JsonPrimitive("positive"),
+                                            JsonPrimitive("neutral"),
+                                            JsonPrimitive("negative"),
+                                        ),
+                                    ),
+                                )
+                                put("name", "sentiment")
+                            },
+                        ),
+                    metadata = mapOf("suite" to "smoke"),
+                ),
+            )
         val fetched = api.getEval(EvalId("eval_1"))
         val page = api.listEvals(EvalListQuery(limit = 5))
         val updated = api.updateEval(EvalId("eval_1"), EvalUpdateRequest(name = "updated"))
-        val run = api.createEvalRun(EvalId("eval_1"), EvalRunCreateRequest(name = "smoke-run"))
+        val run =
+            api.createEvalRun(
+                EvalId("eval_1"),
+                EvalRunCreateRequest(
+                    name = "smoke-run",
+                    dataSource =
+                        buildJsonObject {
+                            put("type", "completions")
+                            put(
+                                "source",
+                                buildJsonObject {
+                                    put(
+                                        "type",
+                                        "file_content",
+                                    )
+                                    put(
+                                        "content",
+                                        kotlinx.serialization.json.JsonArray(
+                                            listOf(
+                                                buildJsonObject {
+                                                    put(
+                                                        "item",
+                                                        buildJsonObject {
+                                                            put("input", "Tech Company Launches Advanced Artificial Intelligence Platform")
+                                                            put("ground_truth", "Technology")
+                                                        },
+                                                    )
+                                                },
+                                            ),
+                                        ),
+                                    )
+                                },
+                            )
+                            put(
+                                "input_messages",
+                                buildJsonObject {
+                                    put("type", "template")
+                                    put(
+                                        "template",
+                                        kotlinx.serialization.json.JsonArray(
+                                            listOf(
+                                                buildJsonObject {
+                                                    put("role", "developer")
+                                                    put("content", "Categorize the headline")
+                                                },
+                                                buildJsonObject {
+                                                    put("role", "user")
+                                                    put("content", "{{item.input}}")
+                                                },
+                                            ),
+                                        ),
+                                    )
+                                },
+                            )
+                            put("model", "gpt-4o-mini")
+                        },
+                    metadata = mapOf("suite" to "smoke"),
+                ),
+            )
         val fetchedRun = api.getEvalRun(EvalId("eval_1"), EvalRunId("run_1"))
         val runPage =
             api.listEvalRuns(
@@ -5743,7 +7220,12 @@ class OpenAIApiSpec {
         assertTrue(deletedRun.deleted)
         assertTrue(deletedEval.deleted)
         assertTrue(seenBodies.first().contains("\"name\":\"baseline\""))
+        assertTrue(seenBodies.first().contains("\"data_source_config\""))
+        assertTrue(seenBodies.first().contains("\"testing_criteria\""))
         assertTrue(seenBodies.first().contains("\"suite\":\"smoke\""))
+        assertTrue(seenBodies[4].contains("\"data_source\""))
+        assertTrue(seenBodies[4].contains("\"type\":\"completions\""))
+        assertTrue(seenBodies[4].contains("\"model\":\"gpt-4o-mini\""))
         assertTrue(seenPaths.contains("/v1/evals/eval_1/runs?limit=5&order=desc&after=run_0&status=completed"))
         assertTrue(seenPaths.contains("/v1/evals/eval_1/runs/run_1/output_items?limit=5&order=desc&after=out_0&status=pass"))
     }
@@ -5754,29 +7236,14 @@ class OpenAIApiSpec {
         val client = httpClient { request ->
             seenPaths += request.url.encodedPath
             when (request.url.encodedPath) {
-                "/v1/evals/eval_1/runs/run_1/cancel" -> {
+                "/v1/evals/eval_1/runs/run_1" -> {
                     assertEquals(HttpMethod.Post, request.method)
+                    assertEquals("{}", request.bodyText())
                     respondJson("""{"id":"run_1","object":"eval.run","status":"canceled"}""")
                 }
                 "/v1/evals/eval_1/runs/run_1/output_items/out_1" -> {
                     assertEquals(HttpMethod.Get, request.method)
-                    respondJson(
-                        """
-                        {
-                          "id":"out_1",
-                          "object":"eval.run.output_item",
-                          "status":"pass",
-                          "eval_id":"eval_1",
-                          "run_id":"run_1",
-                          "results":[{"name":"grader","passed":true,"score":1.0}],
-                          "sample":{
-                            "model":"gpt-5",
-                            "input":[{"role":"user","content":"hello"}],
-                            "output":[{"role":"assistant","content":"hi"}]
-                          }
-                        }
-                        """.trimIndent(),
-                    )
+                    respondJson(DocumentedEvalRunOutputItemJson)
                 }
                 else -> error("unexpected path ${request.url.encodedPath}")
             }
@@ -5787,19 +7254,92 @@ class OpenAIApiSpec {
         val output = api.getEvalRunOutputItem(EvalId("eval_1"), EvalRunId("run_1"), EvalRunOutputItemId("out_1"))
 
         assertEquals(EvalRunStatus.Canceled, cancelled.status)
-        assertEquals("out_1", output.id)
+        assertEquals("outputitem_67e5796c28e081909917bf79f6e6214d", output.id)
         assertEquals(EvalRunOutputItemStatus.Pass, output.status)
-        assertEquals("eval_1", output.evalId)
-        assertEquals("run_1", output.runId)
-        assertEquals("true", output.results?.single()?.jsonObject?.get("passed")?.jsonPrimitive?.content)
-        assertEquals("gpt-5", output.sample?.get("model")?.jsonPrimitive?.content)
+        assertEquals("eval_67abd54d9b0081909a86353f6fb9317a", output.evalId)
+        assertEquals("evalrun_67abd54d60ec8190832b46859da808f7", output.runId)
+        assertEquals(true, output.results.singleOrNull()?.passed)
+        assertEquals("gpt-4o-mini-2024-07-18", output.sample?.model)
         assertEquals(
             listOf(
-                "/v1/evals/eval_1/runs/run_1/cancel",
+                "/v1/evals/eval_1/runs/run_1",
                 "/v1/evals/eval_1/runs/run_1/output_items/out_1",
             ),
             seenPaths,
         )
+    }
+
+    @Test
+    fun `eval run output item failed filter serializes as fail`() {
+        val parameters =
+            EvalRunOutputItemListQuery(
+                limit = 5,
+                order = EvalListOrder.DESC,
+                status = EvalRunOutputItemStatus.Failed,
+            ).toParameters()
+
+        assertEquals(
+            listOf(
+                "limit" to "5",
+                "order" to "desc",
+                "status" to "fail",
+            ),
+            parameters,
+        )
+    }
+
+    @Test
+    fun `eval object decodes documented data source and testing criteria fields`() {
+        val eval =
+            OpenAIJson.decodeFromString<EvalObject>(
+                DocumentedEvalObjectJson,
+            )
+
+        assertEquals("eval_67b7fa9a81a88190ab4aa417e397ea21", eval.id)
+        assertEquals("stored_completions", eval.dataSourceConfig?.type)
+        assertEquals("chatbot", eval.dataSourceConfig?.metadata?.get("usecase")?.jsonPrimitive?.content)
+        assertEquals("object", eval.dataSourceConfig?.schema?.get("type")?.jsonPrimitive?.content)
+        assertEquals("label_model", eval.testingCriteria.singleOrNull()?.type)
+        assertEquals("o3-mini", eval.testingCriteria.singleOrNull()?.model)
+        assertEquals("positive", eval.testingCriteria.singleOrNull()?.passingLabels?.singleOrNull())
+        assertEquals("Sentiment", eval.name)
+    }
+
+    @Test
+    fun `eval run object decodes documented result and data source fields`() {
+        val run =
+            OpenAIJson.decodeFromString<EvalRunObject>(
+                DocumentedEvalRunObjectJson,
+            )
+
+        assertEquals("evalrun_67e57965b480819094274e3a32235e4c", run.id)
+        assertEquals(EvalRunStatus.Queued, run.status)
+        assertEquals("https://platform.openai.com/evaluations/eval_67e579652b548190aaa83ada4b125f47&run_id=evalrun_67e57965b480819094274e3a32235e4c", run.reportUrl)
+        assertEquals("completions", run.dataSource?.type)
+        assertEquals("file_content", run.dataSource?.source?.get("type")?.jsonPrimitive?.content)
+        assertEquals("template", run.dataSource?.inputMessages?.get("type")?.jsonPrimitive?.content)
+        assertEquals("gpt-4o-mini", run.dataSource?.model)
+        assertEquals(0, run.resultCounts?.failed)
+        assertEquals(0, run.resultCounts?.passed)
+        assertNull(run.perModelUsage)
+        assertNull(run.perTestingCriteriaResults)
+    }
+
+    @Test
+    fun `eval run output item decodes documented sample and results fields`() {
+        val outputItem =
+            OpenAIJson.decodeFromString<EvalRunOutputItemObject>(
+                DocumentedEvalRunOutputItemJson,
+            )
+
+        assertEquals("outputitem_67e5796c28e081909917bf79f6e6214d", outputItem.id)
+        assertEquals(EvalRunOutputItemStatus.Pass, outputItem.status)
+        assertEquals("grader", outputItem.results.singleOrNull()?.name)
+        assertEquals(true, outputItem.results.singleOrNull()?.passed)
+        assertEquals(1.0, outputItem.results.singleOrNull()?.score)
+        assertEquals("gpt-4o-mini-2024-07-18", outputItem.sample?.model)
+        assertEquals("user", outputItem.sample?.input?.singleOrNull()?.jsonObject?.get("role")?.jsonPrimitive?.content)
+        assertEquals("assistant", outputItem.sample?.output?.singleOrNull()?.jsonObject?.get("role")?.jsonPrimitive?.content)
     }
 
     @Test
@@ -5812,51 +7352,86 @@ class OpenAIApiSpec {
             when (request.url.encodedPath) {
                 "/v1/videos" ->
                     if (request.method == HttpMethod.Post) {
-                        respondJson("""{"id":"vid_1","object":"video","status":"queued","model":"sora-2"}""")
+                        respondJson(DocumentedVideoObjectJson)
                     } else {
-                        respondJson("""{"object":"list","data":[{"id":"vid_1","object":"video","status":"completed"}],"has_more":false}""")
+                        respondJson(DocumentedVideoListPageJson)
                     }
-                "/v1/videos/vid_1/remix" ->
+                "/v1/videos/video_123/remix" ->
                     respondJson("""{"id":"vid_2","object":"video","status":"queued"}""")
-                "/v1/videos/vid_1" ->
+                "/v1/videos/video_123" ->
                     when (request.method) {
-                        HttpMethod.Get -> respondJson("""{"id":"vid_1","object":"video","status":"completed"}""")
-                        HttpMethod.Delete -> respondJson("""{"id":"vid_1","object":"video.deleted","deleted":true}""")
+                        HttpMethod.Get -> respondJson(DocumentedVideoRetrieveJson)
+                        HttpMethod.Delete -> respondJson(DocumentedVideoDeleteJson)
                         else -> error("unexpected method ${request.method}")
                     }
-                "/v1/videos/vid_1/content" ->
+                "/v1/videos/video_123/content" ->
                     respond(content = "VIDEO", status = HttpStatusCode.OK, headers = headersOf(HttpHeaders.ContentType, "video/mp4"))
                 else -> error("unexpected path ${request.url.encodedPath}")
             }
         }
 
         val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
-        val created = api.createVideo(VideoCreateRequest(model = ModelId("sora-2"), prompt = "A red cube"))
-        val remixed = api.remixVideo(VideoId("vid_1"), VideoRemixRequest(prompt = "Make it blue"))
-        val page = api.listVideos(VideoListQuery(limit = 5))
-        val fetched = api.getVideo(VideoId("vid_1"))
-        val content = api.downloadVideoContent(VideoId("vid_1"))
-        val deleted = api.deleteVideo(VideoId("vid_1"))
+        val created = api.createVideo(VideoCreateRequest(model = null, prompt = "A red cube"))
+        val remixed = api.remixVideo(VideoId("video_123"), VideoRemixRequest(prompt = "Make it blue"))
+        val page = api.listVideos(VideoListQuery(limit = 5, order = VideoListOrder.DESC))
+        val fetched = api.getVideo(VideoId("video_123"))
+        val content = api.downloadVideoContent(VideoId("video_123"), VideoContentVariant.THUMBNAIL)
+        val deleted = api.deleteVideo(VideoId("video_123"))
 
-        assertEquals("vid_1", created.id)
+        assertEquals("video_123", created.id)
         assertEquals("vid_2", remixed.id)
-        assertEquals("vid_1", page.data.single().id)
-        assertEquals("vid_1", fetched.id)
+        assertEquals("video_123", page.data.single().id)
+        assertEquals("id", fetched.id)
         assertEquals(VideoStatus.Queued, created.status)
         assertEquals(VideoStatus.Queued, remixed.status)
         assertEquals(VideoStatus.Completed, page.data.single().status)
-        assertEquals(VideoStatus.Completed, fetched.status)
+        assertEquals(VideoStatus.Queued, fetched.status)
+        assertEquals("prompt", fetched.prompt)
         assertEquals("VIDEO", content.decodeToString())
         assertTrue(deleted.deleted)
         assertTrue(seenBodies.first().contains("\"prompt\":\"A red cube\""))
         assertTrue(seenBodies[1].contains("\"prompt\":\"Make it blue\""))
+        assertFalse(seenBodies.first().contains("\"model\":"))
+        assertTrue(seenPaths.contains("/v1/videos?limit=5&order=desc"))
+        assertTrue(seenPaths.contains("/v1/videos/video_123/content?variant=thumbnail"))
+    }
+
+    @Test
+    fun `downloadVideoContentTo streams binary payload with current variant query`() = runTest {
+        val seenPaths = mutableListOf<String>()
+        val client = httpClient { request ->
+            seenPaths +=
+                buildString {
+                    append(request.url.encodedPath)
+                    request.url.encodedQuery.takeIf { it.isNotEmpty() }?.let {
+                        append('?')
+                        append(it)
+                    }
+                }
+            assertEquals(HttpMethod.Get, request.method)
+            respond(
+                content = "VIDEO-STREAM",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "video/mp4"),
+            )
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        val chunks = mutableListOf<ByteArray>()
+
+        api.downloadVideoContentTo(VideoId("vid_1"), VideoContentVariant.THUMBNAIL) { chunk ->
+            chunks += chunk
+        }
+
+        assertEquals(listOf("/v1/videos/vid_1/content?variant=thumbnail"), seenPaths)
+        assertEquals("VIDEO-STREAM", chunks.concatByteArrays().decodeToString())
     }
 
     @Test
     fun `video request serializes current input reference size and seconds`() {
         val request =
             VideoCreateRequest(
-                model = ModelId("sora-2"),
+                model = null,
                 prompt = "A red cube",
                 inputReference = VideoInputReference(fileId = FileId("file_img")),
                 size = VideoSize.P720X1280,
@@ -5867,6 +7442,67 @@ class OpenAIApiSpec {
         assertTrue(json.contains("\"input_reference\":{\"file_id\":\"file_img\"}"))
         assertTrue(json.contains("\"size\":\"720x1280\""))
         assertTrue(json.contains("\"seconds\":\"8\""))
+        assertFalse(json.contains("\"model\":"))
+        assertFalse(json.contains("\"reference_assets\":"))
+    }
+
+    @Test
+    fun `video create rejects legacy reference assets and extension only durations`() {
+        assertFailsWith<IllegalArgumentException> {
+            VideoCreateRequest(
+                model = null,
+                prompt = "A red cube",
+                referenceAssets = kotlinx.serialization.json.JsonArray(listOf(JsonPrimitive("legacy"))),
+            )
+        }
+
+        assertFailsWith<IllegalArgumentException> {
+            VideoCreateRequest(
+                model = null,
+                prompt = "A red cube",
+                seconds = VideoSeconds.S16,
+            )
+        }
+    }
+
+    @Test
+    fun `video remix rejects legacy reference assets`() {
+        assertFailsWith<IllegalArgumentException> {
+            VideoRemixRequest(
+                prompt = "Make it blue",
+                referenceAssets = kotlinx.serialization.json.JsonArray(listOf(JsonPrimitive("legacy"))),
+            )
+        }
+    }
+
+    @Test
+    fun `video list query accepts zero limit and serializes order`() {
+        val query = VideoListQuery(limit = 0, order = VideoListOrder.ASC)
+
+        assertEquals(listOf("limit" to "0", "order" to "asc"), query.toParameters())
+    }
+
+    @Test
+    fun `video object decodes current stable response fields`() {
+        val video =
+            OpenAIJson.decodeFromString<VideoObject>(
+                DocumentedVideoObjectJson,
+            )
+
+        assertEquals("video_123", video.id)
+        assertEquals("video", video.objectType)
+        assertEquals(VideoStatus.Queued, video.status)
+        assertEquals(1712697600L, video.createdAt)
+        assertNull(video.completedAt)
+        assertNull(video.expiresAt)
+        assertEquals("sora-2", video.model)
+        assertEquals(0, video.progress)
+        assertNull(video.prompt)
+        assertNull(video.remixedFromVideoId)
+        assertEquals("8", video.seconds)
+        assertEquals("1024x1792", video.size)
+        assertEquals("standard", video.quality)
+        assertNull(video.error)
     }
 
     @Test
@@ -5932,6 +7568,39 @@ class OpenAIApiSpec {
         assertTrue(assertNotNull(requestsByPath["/v1/videos/edits"]).bodyText().contains("\"prompt\":\"Make it blue\""))
         assertTrue(assertNotNull(requestsByPath["/v1/videos/extensions"]).bodyText().contains("\"seconds\":\"12\""))
         assertTrue(assertNotNull(requestsByPath["/v1/videos/extensions"]).bodyText().contains("\"video\":{\"id\":\"vid_1\"}"))
+    }
+
+    @Test
+    fun `createVideoCharacter accepts streaming binary upload`() = runTest {
+        var seenRequest: HttpRequestData? = null
+        val client = httpClient { request ->
+            seenRequest = request
+            assertEquals(HttpMethod.Post, request.method)
+            assertEquals("/v1/videos/characters", request.url.encodedPath)
+            respondJson("""{"id":"char_stream","created_at":1,"name":"Hero"}""")
+        }
+
+        val api = KtorOpenAIApi(client, OpenAIApi.Config(apiKey = "secret"))
+        val character =
+            api.createVideoCharacter(
+                StreamingVideoCharacterCreateRequest(
+                    name = "Hero",
+                    video =
+                        StreamingBinaryUpload(
+                            filename = "hero.mp4",
+                            sizeBytes = 5,
+                            contentType = "video/mp4",
+                        ) { ByteReadChannel("VIDEO".encodeToByteArray()) },
+                ),
+            )
+
+        assertEquals("char_stream", character.id)
+        val request = assertNotNull(seenRequest)
+        assertTrue((request.body.contentType?.toString() ?: "").startsWith("multipart/form-data"))
+        val body = request.bodyText()
+        assertTrue(body.contains("Hero"))
+        assertTrue(body.contains("hero.mp4"))
+        assertTrue(body.contains("VIDEO"))
     }
 
     @Test
@@ -6121,6 +7790,341 @@ private fun singleImmediateRetryPolicy(): OpenAIRetryPolicy =
         }
     }
 
+// Source fixture: OpenAI API reference "Create chat completion" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
+private val DocumentedChatCompletionCreateExampleJson =
+    """
+    {
+      "id": "chatcmpl-B9MBs8CjcvOU2jLn4n570S5qMJKcT",
+      "object": "chat.completion",
+      "created": 1741569952,
+      "model": "gpt-5.4",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Hello! How can I assist you today?",
+            "refusal": null,
+            "annotations": []
+          },
+          "logprobs": null,
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 19,
+        "completion_tokens": 10,
+        "total_tokens": 29,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "accepted_prediction_tokens": 0,
+          "rejected_prediction_tokens": 0
+        }
+      },
+      "service_tier": "default"
+    }
+    """.trimIndent()
+
+// Source fixture: OpenAI API reference "Create eval" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/evals/methods/create
+private val DocumentedEvalObjectJson =
+    """
+    {
+      "object":"eval",
+      "id":"eval_67b7fa9a81a88190ab4aa417e397ea21",
+      "data_source_config":{
+        "type":"stored_completions",
+        "metadata":{"usecase":"chatbot"},
+        "schema":{
+          "type":"object",
+          "properties":{"item":{"type":"object"},"sample":{"type":"object"}},
+          "required":["item","sample"]
+        }
+      },
+      "testing_criteria":[
+        {
+          "name":"Example label grader",
+          "type":"label_model",
+          "model":"o3-mini",
+          "input":[
+            {
+              "type":"message",
+              "role":"developer",
+              "content":{
+                "type":"input_text",
+                "text":"Classify the sentiment of the following statement as one of positive, neutral, or negative"
+              }
+            },
+            {
+              "type":"message",
+              "role":"user",
+              "content":{
+                "type":"input_text",
+                "text":"Statement: {{item.input}}"
+              }
+            }
+          ],
+          "passing_labels":["positive"],
+          "labels":["positive","neutral","negative"]
+        }
+      ],
+      "name":"Sentiment",
+      "created_at":1740110490,
+      "metadata":{"description":"An eval for sentiment analysis"}
+    }
+    """.trimIndent()
+
+// Source fixture: OpenAI API reference "Create eval run" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/evals/subresources/runs/methods/create
+private val DocumentedEvalRunObjectJson =
+    """
+    {
+      "object":"eval.run",
+      "id":"evalrun_67e57965b480819094274e3a32235e4c",
+      "eval_id":"eval_67e579652b548190aaa83ada4b125f47",
+      "report_url":"https://platform.openai.com/evaluations/eval_67e579652b548190aaa83ada4b125f47&run_id=evalrun_67e57965b480819094274e3a32235e4c",
+      "status":"queued",
+      "model":"gpt-4o-mini",
+      "name":"gpt-4o-mini",
+      "created_at":1743092069,
+      "result_counts":{"total":0,"errored":0,"failed":0,"passed":0},
+      "per_model_usage":null,
+      "per_testing_criteria_results":null,
+      "data_source":{
+        "type":"completions",
+        "source":{
+          "type":"file_content",
+          "content":[{"item":{"input":"Tech Company Launches Advanced Artificial Intelligence Platform","ground_truth":"Technology"}}]
+        },
+        "input_messages":{
+          "type":"template",
+          "template":[
+            {
+              "type":"message",
+              "role":"developer",
+              "content":{"type":"input_text","text":"Categorize the headline"}
+            }
+          ]
+        },
+        "sampling_params":{"temperature":1,"max_completions_tokens":2048,"top_p":1,"seed":42},
+        "model":"gpt-4o-mini"
+      }
+    }
+    """.trimIndent()
+
+// Source fixture: adapted from OpenAI API reference "Retrieve eval run output item", accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/evals/subresources/runs/subresources/output_items/methods/retrieve
+private val DocumentedEvalRunOutputItemJson =
+    """
+    {
+      "id":"outputitem_67e5796c28e081909917bf79f6e6214d",
+      "object":"eval.run.output_item",
+      "status":"pass",
+      "eval_id":"eval_67abd54d9b0081909a86353f6fb9317a",
+      "run_id":"evalrun_67abd54d60ec8190832b46859da808f7",
+      "results":[{"name":"grader","passed":true,"score":1.0}],
+      "sample":{
+        "model":"gpt-4o-mini-2024-07-18",
+        "input":[{"role":"user","content":"hello"}],
+        "output":[{"role":"assistant","content":"hi"}]
+      }
+    }
+    """.trimIndent()
+
+// Source fixture: OpenAI API reference "Get chat completion" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/retrieve
+private val DocumentedStoredChatCompletionGetJson =
+    """
+    {
+      "object": "chat.completion",
+      "id": "chatcmpl-abc123",
+      "model": "gpt-4o-2024-08-06",
+      "created": 1738960610,
+      "request_id": "req_ded8ab984ec4bf840f37566c1011c417",
+      "tool_choice": null,
+      "usage": {
+        "total_tokens": 31,
+        "completion_tokens": 18,
+        "prompt_tokens": 13
+      },
+      "seed": 4944116822809979520,
+      "top_p": 1.0,
+      "temperature": 1.0,
+      "presence_penalty": 0.0,
+      "frequency_penalty": 0.0,
+      "system_fingerprint": "fp_50cad350e4",
+      "input_user": null,
+      "service_tier": "default",
+      "tools": null,
+      "metadata": {},
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "content": "Mind of circuits hum,  \nLearning patterns in silence—  \nFuture's quiet spark.",
+            "role": "assistant",
+            "tool_calls": null,
+            "function_call": null
+          },
+          "finish_reason": "stop",
+          "logprobs": null
+        }
+      ],
+      "response_format": null
+    }
+    """.trimIndent()
+
+// Source fixture: OpenAI API reference "List chat completions" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/list
+private val DocumentedStoredChatCompletionListJson =
+    """
+    {
+      "object": "list",
+      "data": [
+        {
+          "id": "chatcmpl-AyPNinnUqUDYo9SAdA52NobMflmj2",
+          "object": "chat.completion",
+          "created": 1738960610,
+          "model": "gpt-4o-2024-08-06",
+          "metadata": {}
+        }
+      ],
+      "first_id": "chatcmpl-AyPNinnUqUDYo9SAdA52NobMflmj2",
+      "last_id": "chatcmpl-AyPNinnUqUDYo9SAdA52NobMflmj2",
+      "has_more": false
+    }
+    """.trimIndent()
+
+// Source fixture: OpenAI API reference "Update chat completion" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/update
+private val DocumentedStoredChatCompletionUpdateJson =
+    """
+    {
+      "id": "chatcmpl-AyPNinnUqUDYo9SAdA52NobMflmj2",
+      "object": "chat.completion",
+      "created": 1738960610,
+      "model": "gpt-4o-2024-08-06",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Hello! How can I assist you today?"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "metadata": {
+        "foo": "bar"
+      }
+    }
+    """.trimIndent()
+
+// Source fixture: OpenAI API reference "Get chat messages" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/chat/subresources/completions/subresources/messages/methods/list
+private val DocumentedStoredChatCompletionMessagesJson =
+    """
+    {
+      "object": "list",
+      "data": [
+        {
+          "id": "chatcmpl-AyPNinnUqUDYo9SAdA52NobMflmj2-0",
+          "role": "user",
+          "content": "Hello!"
+        }
+      ],
+      "first_id": "chatcmpl-AyPNinnUqUDYo9SAdA52NobMflmj2-0",
+      "last_id": "chatcmpl-AyPNinnUqUDYo9SAdA52NobMflmj2-0",
+      "has_more": false
+    }
+    """.trimIndent()
+
+// Source fixture: OpenAI API reference "Delete chat completion" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/delete
+private val DocumentedStoredChatCompletionDeleteJson =
+    """
+    {
+      "object": "chat.completion.deleted",
+      "id": "chatcmpl-AyPNinnUqUDYo9SAdA52NobMflmj2",
+      "deleted": true
+    }
+    """.trimIndent()
+
+// Source fixture: OpenAI API reference "Create video" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/videos/methods/create
+private val DocumentedVideoObjectJson =
+    """
+    {
+      "id": "video_123",
+      "object": "video",
+      "model": "sora-2",
+      "status": "queued",
+      "progress": 0,
+      "created_at": 1712697600,
+      "size": "1024x1792",
+      "seconds": "8",
+      "quality": "standard"
+    }
+    """.trimIndent()
+
+// Source fixture: OpenAI API reference "Retrieve video" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/videos/methods/retrieve
+private val DocumentedVideoRetrieveJson =
+    """
+    {
+      "id": "id",
+      "completed_at": 0,
+      "created_at": 0,
+      "error": {
+        "code": "code",
+        "message": "message"
+      },
+      "expires_at": 0,
+      "model": "string",
+      "object": "video",
+      "progress": 0,
+      "prompt": "prompt",
+      "remixed_from_video_id": "remixed_from_video_id",
+      "seconds": "seconds",
+      "size": "720x1280",
+      "status": "queued"
+    }
+    """.trimIndent()
+
+// Source fixture: OpenAI API reference "List videos" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/videos/methods/list
+private val DocumentedVideoListPageJson =
+    """
+    {
+      "data": [
+        {
+          "id": "video_123",
+          "object": "video",
+          "model": "sora-2",
+          "status": "completed"
+        }
+      ],
+      "object": "list"
+    }
+    """.trimIndent()
+
+// Source fixture: OpenAI API reference "Delete video" response example, accessed 2026-04-05.
+// https://developers.openai.com/api/reference/resources/videos/methods/delete
+private val DocumentedVideoDeleteJson =
+    """
+    {
+      "id": "id",
+      "deleted": true,
+      "object": "video.deleted"
+    }
+    """.trimIndent()
+
 private fun MockRequestHandleScope.respondJson(body: String) =
     respond(
         content = body,
@@ -6146,6 +8150,17 @@ private suspend fun HttpRequestData.bodyText(): String =
         is OutgoingContent.ByteArrayContent -> value.bytes().decodeToString()
         else -> bodyBytes().decodeToString()
     }
+
+private fun List<ByteArray>.concatByteArrays(): ByteArray {
+    val total = sumOf { it.size }
+    val result = ByteArray(total)
+    var offset = 0
+    forEach { chunk ->
+        chunk.copyInto(result, destinationOffset = offset)
+        offset += chunk.size
+    }
+    return result
+}
 
 private suspend fun readAll(channel: ByteReadChannel): ByteArray {
     val chunks = mutableListOf<ByteArray>()
@@ -6175,7 +8190,7 @@ private suspend fun failingChannel(
         if (prefix.isNotEmpty()) {
             channel.writeFully(prefix.encodeToByteArray())
         }
-        channel.cancel(IOException(message))
+        channel.cancel(IllegalStateException(message))
     }
 
 private suspend fun signWebhook(secret: String, payload: ByteArray, webhookId: String, webhookTimestamp: String): String {

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package one.wabbit.web.openai
 
 import kotlinx.serialization.SerialName
@@ -37,9 +39,12 @@ data class VideoReference(
 }
 
 data class VideoCreateRequest(
-    val model: ModelId,
+    val model: ModelId? = null,
     val prompt: String,
     val inputReference: VideoInputReference? = null,
+    @Deprecated(
+        message = "reference_assets is not part of the current OpenAI video create schema; use inputReference for OpenAI or extraBody for provider-specific extensions",
+    )
     val referenceAssets: JsonArray? = null,
     val n: Int? = null,
     val size: VideoSize? = null,
@@ -48,15 +53,20 @@ data class VideoCreateRequest(
 ) {
     init {
         require(prompt.isNotBlank()) { "video prompt must not be blank" }
+        require(referenceAssets == null) {
+            "video referenceAssets is not supported by the current OpenAI create video schema; use inputReference instead"
+        }
         require(n == null || n > 0) { "video n must be positive when set" }
+        require(seconds == null || seconds in setOf(VideoSeconds.S4, VideoSeconds.S8, VideoSeconds.S12)) {
+            "video create seconds must be one of 4, 8, or 12 when set"
+        }
     }
 
     fun toJson(): JsonObject =
         buildJsonObject {
-            put("model", model.value)
+            model?.let { put("model", it.value) }
             put("prompt", prompt)
             inputReference?.let { put("input_reference", it.toJson()) }
-            referenceAssets?.let { put("reference_assets", it) }
             n?.let { put("n", it) }
             size?.let { put("size", it.wireName) }
             seconds?.let { put("seconds", it.wireName) }
@@ -69,7 +79,16 @@ data class VideoCharacterCreateRequest(
     val video: BinaryUpload,
 ) {
     init {
-        require(name.isNotBlank()) { "video character name must not be blank" }
+        validateVideoCharacterName(name)
+    }
+}
+
+data class StreamingVideoCharacterCreateRequest(
+    val name: String,
+    val video: StreamingBinaryUpload,
+) {
+    init {
+        validateVideoCharacterName(name)
     }
 }
 
@@ -110,28 +129,43 @@ data class VideoExtendRequest(
 }
 
 data class VideoRemixRequest(
-    val prompt: String? = null,
+    val prompt: String,
+    @Deprecated(
+        message = "reference_assets is not part of the current OpenAI video remix schema; use the path video_id and prompt only",
+    )
     val referenceAssets: JsonArray? = null,
     val extraBody: JsonExtras? = null,
 ) {
     init {
-        require(prompt == null || prompt.isNotBlank()) { "video remix prompt must not be blank when set" }
+        require(prompt.isNotBlank()) { "video remix prompt must not be blank" }
+        require(referenceAssets == null) {
+            "video remix referenceAssets is not supported by the current OpenAI remix schema"
+        }
     }
 
     fun toJson(): JsonObject =
         buildJsonObject {
-            prompt?.let { put("prompt", it) }
-            referenceAssets?.let { put("reference_assets", it) }
+            put("prompt", prompt)
             putJsonExtras(extraBody)
         }
+}
+
+private fun validateVideoCharacterName(name: String) {
+    require(name.isNotBlank()) { "video character name must not be blank" }
+}
+
+enum class VideoListOrder(val wireName: String) {
+    ASC("asc"),
+    DESC("desc"),
 }
 
 data class VideoListQuery(
     val limit: Int = 20,
     val after: String? = null,
+    val order: VideoListOrder? = null,
 ) {
     init {
-        require(limit in 1..100) { "video list limit must be between 1 and 100" }
+        require(limit in 0..100) { "video list limit must be between 0 and 100" }
         require(after == null || after.isNotBlank()) { "video list after must not be blank when set" }
     }
 
@@ -139,7 +173,14 @@ data class VideoListQuery(
         buildList {
             add("limit" to limit.toString())
             after?.let { add("after" to it) }
+            order?.let { add("order" to it.wireName) }
         }
+}
+
+enum class VideoContentVariant(val wireName: String) {
+    VIDEO("video"),
+    THUMBNAIL("thumbnail"),
+    SPRITESHEET("spritesheet"),
 }
 
 @Serializable

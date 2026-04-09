@@ -627,7 +627,7 @@ attach them to the start of each source file to most effectively state
 the exclusion of warranty; and each file should have at least the
 "copyright" line and a pointer to where the full notice is found.
 
-        kotlin-web-openai
+        kotlin-web-openai: Kotlin Multiplatform client for the OpenAI API, with typed requests, streaming support, multipart uploads, and live-smoke-tested high-risk endpoints.
         Copyright (C) 2026  Wabbit Corporation
 
         This program is free software: you can redistribute it and/or modify

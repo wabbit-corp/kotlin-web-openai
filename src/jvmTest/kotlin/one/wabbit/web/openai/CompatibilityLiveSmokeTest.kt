@@ -1,9 +1,12 @@
+// SPDX-License-Identifier: LicenseRef-Wabbit-Public-Test-License
+
 package one.wabbit.web.openai
 
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.HttpTimeout
 import kotlinx.coroutines.test.runTest
+import org.junit.Assume.assumeTrue
 import kotlin.test.Test
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -11,7 +14,7 @@ import kotlin.test.assertTrue
 class CompatibilityLiveSmokeTest {
     @Test
     fun `live openrouter smoke`() = runTest {
-        val config = loadLiveOpenRouterConfigOrNull() ?: return@runTest
+        val config = requireLiveConfig(loadLiveOpenRouterConfigOrNull(), "Live OpenRouter config required")
         val client =
             HttpClient(CIO) {
                 install(HttpTimeout)
@@ -49,7 +52,7 @@ class CompatibilityLiveSmokeTest {
 
     @Test
     fun `live azure smoke`() = runTest {
-        val config = loadLiveAzureConfigOrNull() ?: return@runTest
+        val config = requireLiveConfig(loadLiveAzureConfigOrNull(), "Live Azure config required")
         val client =
             HttpClient(CIO) {
                 install(HttpTimeout)
@@ -84,7 +87,7 @@ class CompatibilityLiveSmokeTest {
 
     @Test
     fun `live groq smoke`() = runTest {
-        val config = loadLiveGroqConfigOrNull() ?: return@runTest
+        val config = requireLiveConfig(loadLiveGroqConfigOrNull(), "Live Groq config required")
         val client =
             HttpClient(CIO) {
                 install(HttpTimeout)
@@ -123,7 +126,7 @@ class CompatibilityLiveSmokeTest {
 
     @Test
     fun `live xai smoke`() = runTest {
-        val config = loadLiveXAiConfigOrNull() ?: return@runTest
+        val config = requireLiveConfig(loadLiveXAiConfigOrNull(), "Live xAI config required")
         val client =
             HttpClient(CIO) {
                 install(HttpTimeout)
@@ -172,7 +175,7 @@ class CompatibilityLiveSmokeTest {
 
     @Test
     fun `live deepseek smoke`() = runTest {
-        val config = loadLiveDeepSeekConfigOrNull() ?: return@runTest
+        val config = requireLiveConfig(loadLiveDeepSeekConfigOrNull(), "Live DeepSeek config required")
         val client =
             HttpClient(CIO) {
                 install(HttpTimeout)
@@ -207,7 +210,7 @@ class CompatibilityLiveSmokeTest {
 
     @Test
     fun `live gemini smoke`() = runTest {
-        val config = loadLiveGeminiConfigOrNull() ?: return@runTest
+        val config = requireLiveConfig(loadLiveGeminiConfigOrNull(), "Live Gemini config required")
         val client =
             HttpClient(CIO) {
                 install(HttpTimeout)
@@ -254,7 +257,7 @@ class CompatibilityLiveSmokeTest {
 
     @Test
     fun `live anthropic compatibility smoke`() = runTest {
-        val config = loadLiveAnthropicConfigOrNull() ?: return@runTest
+        val config = requireLiveConfig(loadLiveAnthropicConfigOrNull(), "Live Anthropic config required")
         val client =
             HttpClient(CIO) {
                 install(HttpTimeout)
@@ -288,7 +291,7 @@ class CompatibilityLiveSmokeTest {
 
     @Test
     fun `live ollama smoke`() = runTest {
-        val config = loadLiveOllamaConfigOrNull() ?: return@runTest
+        val config = requireLiveConfig(loadLiveOllamaConfigOrNull(), "Live Ollama config required")
         val client =
             HttpClient(CIO) {
                 install(HttpTimeout)
@@ -307,7 +310,7 @@ class CompatibilityLiveSmokeTest {
                 )
 
             val models = api.listModels()
-            if (models.data.isEmpty()) return@runTest
+            assumeTrue("Live Ollama smoke requires at least one model", models.data.isNotEmpty())
             val model =
                 config.chatModel?.let { requested -> models.data.firstOrNull { it.id == requested }?.id }
                     ?: models.data.firstOrNull { it.id == "qwen3-vl:4b" }?.id

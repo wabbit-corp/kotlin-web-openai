@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 @file:OptIn(
     dev.whyoleg.cryptography.CryptographyProviderApi::class,
     dev.whyoleg.cryptography.DelicateCryptographyApi::class,

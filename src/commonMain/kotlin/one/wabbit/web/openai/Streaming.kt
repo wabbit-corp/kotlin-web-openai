@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package one.wabbit.web.openai
 
 import io.ktor.utils.io.ByteReadChannel
@@ -590,26 +592,51 @@ suspend fun collectServerSentEvents(
 }
 
 data class ResponseStreamAssembly(
-    val outputText: String = "",
+    val outputTexts: Map<String, String> = emptyMap(),
     val functionCallArguments: Map<String, String> = emptyMap(),
     val mcpCallArguments: Map<String, String> = emptyMap(),
     val reasoningSummaryText: Map<String, String> = emptyMap(),
     val audioData: Map<String, String> = emptyMap(),
     val audioTranscript: Map<String, String> = emptyMap(),
-    val refusalText: String = "",
+    val refusalTexts: Map<String, String> = emptyMap(),
     val finalResponse: ResponseObject? = null,
     val error: ResponseApiError? = null,
     val isDone: Boolean = false,
+) {
+    private fun requireSingleOutputPart(helper: String, values: Map<String, String>, structuredHelper: String): String {
+        check(values.size == 1) {
+            "$helper requires exactly one output part; use $structuredHelper for multi-output streams"
+        }
+        return values.values.single()
+    }
+
+    val outputText: String
+        get() = requireSingleOutputPart("Response stream outputText", outputTexts, "outputTexts")
+
+    val refusalText: String
+        get() = requireSingleOutputPart("Response stream refusalText", refusalTexts, "refusalTexts")
+}
+
+private data class ResponseStreamPosition(
+    val outputIndex: Int,
+    val contentIndex: Int,
+    val itemId: String? = null,
+)
+
+private data class ResponseStreamSlot(
+    val publicKey: String,
+    val outputIndex: Int,
+    val contentIndex: Int,
 )
 
 class ResponseStreamAccumulator {
-    private val outputText = linkedMapOf<String, StringBuilder>()
-    private val refusalText = StringBuilder()
+    private val outputText = linkedMapOf<ResponseStreamPosition, StringBuilder>()
+    private val refusalText = linkedMapOf<ResponseStreamSlot, StringBuilder>()
     private val functionCallArguments = linkedMapOf<String, StringBuilder>()
     private val mcpCallArguments = linkedMapOf<String, StringBuilder>()
-    private val reasoningSummaryText = linkedMapOf<String, StringBuilder>()
-    private val audioData = linkedMapOf<String, StringBuilder>()
-    private val audioTranscript = linkedMapOf<String, StringBuilder>()
+    private val reasoningSummaryText = linkedMapOf<ResponseStreamSlot, StringBuilder>()
+    private val audioData = linkedMapOf<ResponseStreamSlot, StringBuilder>()
+    private val audioTranscript = linkedMapOf<ResponseStreamSlot, StringBuilder>()
     private var finalResponse: ResponseObject? = null
     private var error: ResponseApiError? = null
     private var isDone: Boolean = false
@@ -627,14 +654,50 @@ class ResponseStreamAccumulator {
             }
         }
 
+    private fun outputPosition(
+        itemId: String?,
+        outputIndex: Int?,
+        contentIndex: Int?,
+    ): ResponseStreamPosition =
+        ResponseStreamPosition(
+            outputIndex = outputIndex ?: Int.MAX_VALUE,
+            contentIndex = contentIndex ?: Int.MAX_VALUE,
+            itemId = itemId,
+        )
+
+    private fun streamSlot(
+        itemId: String?,
+        outputIndex: Int?,
+        contentIndex: Int? = null,
+    ): ResponseStreamSlot =
+        ResponseStreamSlot(
+            publicKey = streamKey(itemId, outputIndex, contentIndex),
+            outputIndex = outputIndex ?: Int.MAX_VALUE,
+            contentIndex = contentIndex ?: Int.MAX_VALUE,
+        )
+
+    private fun orderedStringMap(values: Map<ResponseStreamSlot, StringBuilder>): Map<String, String> =
+        values
+            .toList()
+            .sortedWith(compareBy({ it.first.outputIndex }, { it.first.contentIndex }, { it.first.publicKey }))
+            .associateTo(linkedMapOf()) { it.first.publicKey to it.second.toString() }
+
+    private fun orderedOutputTextMap(values: Map<ResponseStreamPosition, StringBuilder>): Map<String, String> =
+        values
+            .toList()
+            .sortedWith(compareBy({ it.first.outputIndex }, { it.first.contentIndex }, { it.first.itemId.orEmpty() }))
+            .associateTo(linkedMapOf()) { (position, builder) ->
+                streamKey(position.itemId, position.outputIndex, position.contentIndex) to builder.toString()
+            }
+
     fun apply(event: ResponseStreamEvent): ResponseStreamAssembly {
         when (event) {
             is ResponseStreamEvent.OutputTextDelta -> {
-                val key = streamKey(event.itemId, event.outputIndex, event.contentIndex)
+                val key = outputPosition(event.itemId, event.outputIndex, event.contentIndex)
                 outputText.getOrPut(key) { StringBuilder() }.append(event.delta)
             }
             is ResponseStreamEvent.OutputTextDone -> {
-                val key = streamKey(event.itemId, event.outputIndex, event.contentIndex)
+                val key = outputPosition(event.itemId, event.outputIndex, event.contentIndex)
                 val builder = outputText.getOrPut(key) { StringBuilder() }
                 event.text?.let {
                     builder.clear()
@@ -666,11 +729,11 @@ class ResponseStreamAccumulator {
                 }
             }
             is ResponseStreamEvent.ReasoningSummaryTextDelta -> {
-                val key = streamKey(event.itemId, event.outputIndex)
+                val key = streamSlot(event.itemId, event.outputIndex)
                 reasoningSummaryText.getOrPut(key) { StringBuilder() }.append(event.delta)
             }
             is ResponseStreamEvent.ReasoningSummaryTextDone -> {
-                val key = streamKey(event.itemId, event.outputIndex)
+                val key = streamSlot(event.itemId, event.outputIndex)
                 val builder = reasoningSummaryText.getOrPut(key) { StringBuilder() }
                 event.text?.let {
                     builder.clear()
@@ -678,11 +741,11 @@ class ResponseStreamAccumulator {
                 }
             }
             is ResponseStreamEvent.AudioDelta -> {
-                val key = streamKey(event.itemId, event.outputIndex, event.contentIndex)
+                val key = streamSlot(event.itemId, event.outputIndex, event.contentIndex)
                 audioData.getOrPut(key) { StringBuilder() }.append(event.delta)
             }
             is ResponseStreamEvent.AudioDone -> {
-                val key = streamKey(event.itemId, event.outputIndex, event.contentIndex)
+                val key = streamSlot(event.itemId, event.outputIndex, event.contentIndex)
                 val builder = audioData.getOrPut(key) { StringBuilder() }
                 event.audio?.let {
                     builder.clear()
@@ -690,21 +753,26 @@ class ResponseStreamAccumulator {
                 }
             }
             is ResponseStreamEvent.AudioTranscriptDelta -> {
-                val key = streamKey(event.itemId, event.outputIndex, event.contentIndex)
+                val key = streamSlot(event.itemId, event.outputIndex, event.contentIndex)
                 audioTranscript.getOrPut(key) { StringBuilder() }.append(event.delta)
             }
             is ResponseStreamEvent.AudioTranscriptDone -> {
-                val key = streamKey(event.itemId, event.outputIndex, event.contentIndex)
+                val key = streamSlot(event.itemId, event.outputIndex, event.contentIndex)
                 val builder = audioTranscript.getOrPut(key) { StringBuilder() }
                 event.transcript?.let {
                     builder.clear()
                     builder.append(it)
                 }
             }
-            is ResponseStreamEvent.RefusalDelta -> refusalText.append(event.delta)
+            is ResponseStreamEvent.RefusalDelta -> {
+                val key = streamSlot(event.itemId, event.outputIndex, event.contentIndex)
+                refusalText.getOrPut(key) { StringBuilder() }.append(event.delta)
+            }
             is ResponseStreamEvent.RefusalDone -> event.refusal?.let {
-                refusalText.clear()
-                refusalText.append(it)
+                val key = streamSlot(event.itemId, event.outputIndex, event.contentIndex)
+                val builder = refusalText.getOrPut(key) { StringBuilder() }
+                builder.clear()
+                builder.append(it)
             }
             is ResponseStreamEvent.ImageGenerationCallPartialImage -> Unit
             is ResponseStreamEvent.HostedToolCallProgress -> Unit
@@ -722,13 +790,13 @@ class ResponseStreamAccumulator {
 
     fun snapshot(): ResponseStreamAssembly =
         ResponseStreamAssembly(
-            outputText = outputText.values.joinToString(separator = "") { it.toString() },
+            outputTexts = orderedOutputTextMap(outputText),
             functionCallArguments = functionCallArguments.mapValues { it.value.toString() },
             mcpCallArguments = mcpCallArguments.mapValues { it.value.toString() },
-            reasoningSummaryText = reasoningSummaryText.mapValues { it.value.toString() },
-            audioData = audioData.mapValues { it.value.toString() },
-            audioTranscript = audioTranscript.mapValues { it.value.toString() },
-            refusalText = refusalText.toString(),
+            reasoningSummaryText = orderedStringMap(reasoningSummaryText),
+            audioData = orderedStringMap(audioData),
+            audioTranscript = orderedStringMap(audioTranscript),
+            refusalTexts = orderedStringMap(refusalText),
             finalResponse = synthesizedFinalResponse(),
             error = error,
             isDone = isDone,
@@ -736,9 +804,11 @@ class ResponseStreamAccumulator {
 
     private fun synthesizedFinalResponse(): ResponseObject? {
         val response = finalResponse ?: return null
-        if (response.outputText().isNotBlank()) return response
+        if (response.outputTexts().isNotEmpty()) return response
 
-        val synthesizedText = outputText.values.joinToString(separator = "") { it.toString() }
+        val synthesizedTexts = orderedOutputTextMap(outputText)
+        if (synthesizedTexts.size != 1) return response
+        val synthesizedText = synthesizedTexts.values.single()
         if (synthesizedText.isBlank()) return response
 
         return response.copy(

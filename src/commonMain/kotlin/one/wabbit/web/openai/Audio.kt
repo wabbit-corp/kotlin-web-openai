@@ -1,13 +1,19 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package one.wabbit.web.openai
 
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonDecoder
@@ -15,6 +21,7 @@ import kotlinx.serialization.json.JsonEncoder
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -194,8 +201,17 @@ data class VoiceCreateRequest(
     val audioSample: BinaryUpload,
 ) {
     init {
-        require(name.isNotBlank()) { "voice name must not be blank" }
-        require(consentId.isNotBlank()) { "voice consentId must not be blank" }
+        validateVoiceCreateFields(name, consentId)
+    }
+}
+
+data class StreamingVoiceCreateRequest(
+    val name: String,
+    val consentId: String,
+    val audioSample: StreamingBinaryUpload,
+) {
+    init {
+        validateVoiceCreateFields(name, consentId)
     }
 }
 
@@ -205,8 +221,17 @@ data class VoiceConsentCreateRequest(
     val recording: BinaryUpload,
 ) {
     init {
-        require(name.isNotBlank()) { "voice consent name must not be blank" }
-        require(language.isNotBlank()) { "voice consent language must not be blank" }
+        validateVoiceConsentCreateFields(name, language)
+    }
+}
+
+data class StreamingVoiceConsentCreateRequest(
+    val name: String,
+    val language: String,
+    val recording: StreamingBinaryUpload,
+) {
+    init {
+        validateVoiceConsentCreateFields(name, language)
     }
 }
 
@@ -372,21 +397,41 @@ data class TranscriptionRequest(
     val extraFields: Map<String, String> = emptyMap(),
 ) {
     init {
-        require(knownSpeakerNames.all { it.isNotBlank() }) {
-            "transcription knownSpeakerNames must not contain blank values"
-        }
-        require(knownSpeakerReferences.all { it.isNotBlank() }) {
-            "transcription knownSpeakerReferences must not contain blank values"
-        }
-        require(knownSpeakerNames.size == knownSpeakerReferences.size) {
-            "transcription knownSpeakerNames and knownSpeakerReferences must have the same size"
-        }
-        require(knownSpeakerNames.size <= 4) {
-            "transcription supports at most 4 knownSpeakerNames"
-        }
-        require(language == null || language.isNotBlank()) { "transcription language must not be blank when set" }
-        require(prompt == null || prompt.isNotBlank()) { "transcription prompt must not be blank when set" }
-        require(extraFields.keys.all { it.isNotBlank() }) { "transcription extra field names must not be blank" }
+        validateTranscriptionRequestFields(
+            owner = "transcription",
+            knownSpeakerNames = knownSpeakerNames,
+            knownSpeakerReferences = knownSpeakerReferences,
+            language = language,
+            prompt = prompt,
+            extraFields = extraFields,
+        )
+    }
+}
+
+data class StreamingTranscriptionRequest(
+    val file: StreamingBinaryUpload,
+    val model: ModelId,
+    val chunkingStrategy: AudioChunkingStrategy? = null,
+    val knownSpeakerNames: List<String> = emptyList(),
+    val knownSpeakerReferences: List<String> = emptyList(),
+    val language: String? = null,
+    val prompt: String? = null,
+    val responseFormat: AudioTextResponseFormat? = null,
+    val stream: Boolean? = null,
+    val temperature: Double? = null,
+    val include: List<AudioTranscriptionInclude> = emptyList(),
+    val timestampGranularities: List<AudioTimestampGranularity> = emptyList(),
+    val extraFields: Map<String, String> = emptyMap(),
+) {
+    init {
+        validateTranscriptionRequestFields(
+            owner = "streaming transcription",
+            knownSpeakerNames = knownSpeakerNames,
+            knownSpeakerReferences = knownSpeakerReferences,
+            language = language,
+            prompt = prompt,
+            extraFields = extraFields,
+        )
     }
 }
 
@@ -399,9 +444,99 @@ data class TranslationRequest(
     val extraFields: Map<String, String> = emptyMap(),
 ) {
     init {
-        require(prompt == null || prompt.isNotBlank()) { "translation prompt must not be blank when set" }
-        require(extraFields.keys.all { it.isNotBlank() }) { "translation extra field names must not be blank" }
+        validateTranslationRequestFields("translation", prompt, extraFields)
     }
+}
+
+data class StreamingTranslationRequest(
+    val file: StreamingBinaryUpload,
+    val model: ModelId,
+    val prompt: String? = null,
+    val responseFormat: AudioTextResponseFormat? = null,
+    val temperature: Double? = null,
+    val extraFields: Map<String, String> = emptyMap(),
+) {
+    init {
+        validateTranslationRequestFields("streaming translation", prompt, extraFields)
+    }
+}
+
+private fun validateVoiceCreateFields(
+    name: String,
+    consentId: String,
+) {
+    require(name.isNotBlank()) { "voice name must not be blank" }
+    require(consentId.isNotBlank()) { "voice consentId must not be blank" }
+}
+
+private fun validateVoiceConsentCreateFields(
+    name: String,
+    language: String,
+) {
+    require(name.isNotBlank()) { "voice consent name must not be blank" }
+    require(language.isNotBlank()) { "voice consent language must not be blank" }
+}
+
+private fun validateTranscriptionRequestFields(
+    owner: String,
+    knownSpeakerNames: List<String>,
+    knownSpeakerReferences: List<String>,
+    language: String?,
+    prompt: String?,
+    extraFields: Map<String, String>,
+) {
+    require(knownSpeakerNames.all { it.isNotBlank() }) {
+        "$owner knownSpeakerNames must not contain blank values"
+    }
+    require(knownSpeakerReferences.all { it.isNotBlank() }) {
+        "$owner knownSpeakerReferences must not contain blank values"
+    }
+    require(knownSpeakerNames.size == knownSpeakerReferences.size) {
+        "$owner knownSpeakerNames and knownSpeakerReferences must have the same size"
+    }
+    require(knownSpeakerNames.size <= 4) {
+        "$owner supports at most 4 knownSpeakerNames"
+    }
+    require(language == null || language.isNotBlank()) { "$owner language must not be blank when set" }
+    require(prompt == null || prompt.isNotBlank()) { "$owner prompt must not be blank when set" }
+    require(extraFields.keys.all { it.isNotBlank() }) { "$owner extra field names must not be blank" }
+    requireNoExtraFieldCollisions(
+        owner = owner,
+        extraFields = extraFields,
+        reservedFieldNames =
+            setOf(
+                "file",
+                "model",
+                "chunking_strategy",
+                "chunking_strategy[type]",
+                "chunking_strategy[threshold]",
+                "chunking_strategy[prefix_padding_ms]",
+                "chunking_strategy[silence_duration_ms]",
+                "known_speaker_names[]",
+                "known_speaker_references[]",
+                "language",
+                "prompt",
+                "response_format",
+                "stream",
+                "temperature",
+                "include[]",
+                "timestamp_granularities[]",
+            ),
+    )
+}
+
+private fun validateTranslationRequestFields(
+    owner: String,
+    prompt: String?,
+    extraFields: Map<String, String>,
+) {
+    require(prompt == null || prompt.isNotBlank()) { "$owner prompt must not be blank when set" }
+    require(extraFields.keys.all { it.isNotBlank() }) { "$owner extra field names must not be blank" }
+    requireNoExtraFieldCollisions(
+        owner = owner,
+        extraFields = extraFields,
+        reservedFieldNames = setOf("file", "model", "prompt", "response_format", "temperature"),
+    )
 }
 
 @Serializable
@@ -419,9 +554,55 @@ data class TranscriptionLogProb(
     val logprob: Double? = null,
 )
 
+sealed interface TranscriptionSegmentIdValue {
+    val wireValue: String
+
+    data class Numeric(
+        val value: Int,
+    ) : TranscriptionSegmentIdValue {
+        override val wireValue: String = value.toString()
+    }
+
+    data class Text(
+        override val wireValue: String,
+    ) : TranscriptionSegmentIdValue {
+        init {
+            require(wireValue.isNotBlank()) { "transcription segment text id must not be blank" }
+        }
+    }
+}
+
+internal object TranscriptionSegmentIdValueSerializer : KSerializer<TranscriptionSegmentIdValue> {
+    override val descriptor: SerialDescriptor =
+        PrimitiveSerialDescriptor("one.wabbit.web.openai.TranscriptionSegmentIdValue", PrimitiveKind.STRING)
+
+    override fun deserialize(decoder: Decoder): TranscriptionSegmentIdValue {
+        val jsonDecoder = decoder as? JsonDecoder ?: error("TranscriptionSegmentIdValueSerializer only supports JSON")
+        val primitive = jsonDecoder.decodeJsonElement() as? JsonPrimitive
+            ?: throw SerializationException("Transcription segment id must be a JSON primitive")
+        return if (primitive.isString) {
+            TranscriptionSegmentIdValue.Text(primitive.content)
+        } else {
+            primitive.intOrNull?.let(TranscriptionSegmentIdValue::Numeric)
+                ?: TranscriptionSegmentIdValue.Text(primitive.content)
+        }
+    }
+
+    override fun serialize(encoder: Encoder, value: TranscriptionSegmentIdValue) {
+        val jsonEncoder = encoder as? JsonEncoder ?: error("TranscriptionSegmentIdValueSerializer only supports JSON")
+        val element =
+            when (value) {
+                is TranscriptionSegmentIdValue.Numeric -> JsonPrimitive(value.value)
+                is TranscriptionSegmentIdValue.Text -> JsonPrimitive(value.wireValue)
+            }
+        jsonEncoder.encodeJsonElement(element)
+    }
+}
+
 @Serializable
 data class TranscriptionSegment(
-    val id: Int? = null,
+    @Serializable(with = TranscriptionSegmentIdValueSerializer::class)
+    val id: TranscriptionSegmentIdValue? = null,
     val text: String? = null,
     val start: Double? = null,
     val end: Double? = null,
@@ -468,10 +649,10 @@ internal object TranscriptionResultSerializer : KSerializer<TranscriptionResult>
         val payload = jsonDecoder.json.decodeFromJsonElement(TranscriptionResultSurrogate.serializer(), jsonDecoder.decodeJsonElement())
         val segmentsElement = payload.segments ?: JsonArray(emptyList())
         val useDiarizedSegments =
-            payload.responseFormat == AudioTextResponseFormatValue.DiarizedJson ||
-                segmentsElement.any { segment ->
-                    segment.jsonObject["id"]?.jsonPrimitive?.isString == true
-                }
+            when (detectTranscriptionSegmentsKind(payload.responseFormat, segmentsElement)) {
+                TranscriptionSegmentsKind.Diarized -> true
+                TranscriptionSegmentsKind.Regular -> false
+            }
         return TranscriptionResult(
             text = payload.text,
             task = payload.task,
@@ -552,6 +733,41 @@ internal object TranscriptionResultSerializer : KSerializer<TranscriptionResult>
         jsonEncoder.encodeJsonElement(payload)
     }
 }
+
+private enum class TranscriptionSegmentsKind {
+    Regular,
+    Diarized,
+}
+
+private fun detectTranscriptionSegmentsKind(
+    responseFormat: AudioTextResponseFormatValue?,
+    segments: JsonArray,
+): TranscriptionSegmentsKind {
+    if (responseFormat != null) {
+        return if (responseFormat == AudioTextResponseFormatValue.DiarizedJson) {
+            TranscriptionSegmentsKind.Diarized
+        } else {
+            TranscriptionSegmentsKind.Regular
+        }
+    }
+
+    val segmentObjects = segments.map { it.jsonObject }
+    if (segmentObjects.any(::looksLikeRegularTranscriptionSegment)) return TranscriptionSegmentsKind.Regular
+    if (segmentObjects.any(::looksLikeDiarizedTranscriptionSegment)) return TranscriptionSegmentsKind.Diarized
+    return TranscriptionSegmentsKind.Regular
+}
+
+private fun looksLikeRegularTranscriptionSegment(segment: JsonObject): Boolean =
+    segment["id"]?.jsonPrimitive?.isString == false ||
+        segment.containsKey("avg_logprob") ||
+        segment.containsKey("compression_ratio") ||
+        segment.containsKey("no_speech_prob") ||
+        segment.containsKey("seek") ||
+        segment.containsKey("temperature") ||
+        segment.containsKey("tokens")
+
+private fun looksLikeDiarizedTranscriptionSegment(segment: JsonObject): Boolean =
+    segment.containsKey("speaker") && !looksLikeRegularTranscriptionSegment(segment)
 
 @Serializable(with = TranscriptionResultSerializer::class)
 data class TranscriptionResult(
