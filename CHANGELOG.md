@@ -4,6 +4,13 @@ All notable changes to `kotlin-web-openai` should be recorded in this file.
 
 This file is the release-note source of truth for published versions. GitHub Releases should summarize the same changes, not replace them.
 
+## Unreleased
+
+- Retain original non-streaming Responses JSON alongside its typed projection for strict caller-owned replay;
+  keep that private body out of serialization and the response's diagnostic string.
+- Preserve raw output-message phases, including future values, so callers can distinguish commentary and final answers.
+- Preserve fatal, cancellation and interruption signals at Responses parsing and shared JSON POST boundaries.
+
 ## 0.0.1 - 2026-04-05
 
 Initial public release.

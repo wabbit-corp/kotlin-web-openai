@@ -30,6 +30,8 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.isSuccess
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.readAvailable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.yield
@@ -42,6 +44,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import one.wabbit.throwables.Throwables
 import one.wabbit.web.common.Etiquette
 import one.wabbit.web.common.RetryAction
 import one.wabbit.web.common.RetryPolicy
@@ -350,13 +353,16 @@ class KtorOpenAIApi(
         url: String,
         cause: Throwable,
         bodySample: String? = null,
-    ): OpenAIApiError.Parse =
-        OpenAIApiError.Parse(
+    ): OpenAIApiError.Parse {
+        // SerializationException inherits IllegalArgumentException, but malformed wire data is not a caller contract bug.
+        Throwables.propagateIfNeeded(cause, Throwables.Policy(rethrowContractViolations = false))
+        return OpenAIApiError.Parse(
             url = url,
             cause = cause,
             bodySample = sanitizeExceptionBodySample(bodySample),
             includeBodySampleInMessage = config.includeBodySamplesInExceptions,
         )
+    }
 
     private fun httpError(
         url: String,
@@ -386,7 +392,7 @@ class KtorOpenAIApi(
             }
 
             try {
-                OpenAIJson.decodeFromString<ResponseObject>(body)
+                OpenAIJson.decodeFromString<ResponseObject>(body).copy(originalJson = body)
             } catch (t: Throwable) {
                 throw parseError(url, t, bodySample = body.take(2048))
             }
@@ -495,7 +501,7 @@ class KtorOpenAIApi(
                 throw decodeError(url, response.status.value, body, response.headers)
             }
             try {
-                OpenAIJson.decodeFromString<ResponseObject>(body)
+                OpenAIJson.decodeFromString<ResponseObject>(body).copy(originalJson = body)
             } catch (t: Throwable) {
                 throw parseError(url, t, bodySample = body.take(2048))
             }
@@ -523,7 +529,7 @@ class KtorOpenAIApi(
             if (!response.status.isSuccess()) {
                 throw decodeError(url, response.status.value, body, response.headers)
             }
-            decodeJsonBody(url, body)
+            decodeJsonBody<ResponseObject>(url, body).copy(originalJson = body)
         }
 
     override suspend fun cancelResponse(responseId: ResponseId): ResponseObject =
@@ -536,7 +542,7 @@ class KtorOpenAIApi(
                 throw decodeError(url, response.status.value, body, response.headers)
             }
             try {
-                OpenAIJson.decodeFromString<ResponseObject>(body)
+                OpenAIJson.decodeFromString<ResponseObject>(body).copy(originalJson = body)
             } catch (t: Throwable) {
                 throw parseError(url, t, bodySample = body.take(2048))
             }
@@ -2781,7 +2787,9 @@ class KtorOpenAIApi(
         }
             .also { observeResponseMetadata(url, it) }
     } catch (t: Throwable) {
-        if (t is CancellationException) throw t
+        // Foreign response streams may report I/O failure as IllegalStateException as well as IOException.
+        Throwables.propagateIfNeeded(t, Throwables.Policy(rethrowContractViolations = false))
+        currentCoroutineContext().ensureActive()
         if (t is OpenAIApiError) throw t
         throw OpenAIApiError.Network(url, t)
     }

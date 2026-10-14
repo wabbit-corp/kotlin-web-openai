@@ -1715,6 +1715,8 @@ data class ResponseOutputItem(
     @SerialName("acknowledged_safety_checks") val acknowledgedSafetyChecks: JsonArray? = null,
     @SerialName("max_output_length") val maxOutputLength: Int? = null,
     @SerialName("created_by") val createdBy: String? = null,
+    /** Raw assistant phase, preserved verbatim so consumers can distinguish or reject future values. */
+    val phase: String? = null,
 ) {
     fun asFunctionCallOrNull(): ResponseFunctionCall? =
         if (type == ResponseItemType.FunctionCall && !name.isNullOrBlank()) {
@@ -2200,7 +2202,15 @@ data class ResponseObject(
     val usage: ResponseUsage? = null,
     val user: String? = null,
     val metadata: JsonObject? = null,
+    /**
+     * Original non-streaming HTTP response, retained for lossless replay/strict caller-owned decoding.
+     * The typed fields are a projection and may omit unknown provider fields. This is null for manually
+     * constructed/deserialized DTOs, is never serialized, and must not be exposed in logs or public history.
+     */
+    @kotlinx.serialization.Transient val originalJson: String? = null,
 ) {
+    override fun toString(): String = "ResponseObject(id=$id, status=$status, model=$model, outputItems=${output.size})"
+
     private fun requireSingleOutputMessage(helper: String): ResponseOutputItem {
         val messages = outputMessages()
         check(messages.size == 1) {
