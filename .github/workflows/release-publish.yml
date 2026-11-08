@@ -14,7 +14,8 @@ env:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    # One Apple Silicon host can build every advertised JVM, Android and Apple publication.
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -31,6 +32,8 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-34 build-tools;34.0.0
 
       - name: Ensure Gradle wrapper is executable
         run: chmod +x ./gradlew
@@ -43,13 +46,13 @@ jobs:
           test "${TAG_TYPE}" = "tag"
 
       - name: Validate release version
-        run: ./gradlew --no-daemon assertReleaseVersion
+        run: ./gradlew --no-daemon --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' assertReleaseVersion
 
       - name: Match tag to published version
         if: github.event_name == 'push'
         run: |
           EXPECTED_VERSION="${GITHUB_REF_NAME#v}"
-          ACTUAL_VERSIONS="$(./gradlew --quiet --no-daemon printVersion)"
+          ACTUAL_VERSIONS="$(./gradlew --quiet --no-daemon --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' printVersion)"
           ACTUAL_VERSIONS="$(printf '%s\n' "${ACTUAL_VERSIONS}" | sed '/^[[:space:]]*$/d')"
           UNIQUE_VERSIONS="$(printf '%s\n' "${ACTUAL_VERSIONS}" | sort -u)"
           test "$(printf '%s\n' "${UNIQUE_VERSIONS}" | wc -l | tr -d ' ')" = "1"
@@ -57,7 +60,7 @@ jobs:
 
       - name: Dry run release build
         if: github.event_name == 'workflow_dispatch'
-        run: ./gradlew --no-daemon build
+        run: ./gradlew --no-daemon --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' build
 
       - name: Publish release to Maven Central
         if: github.event_name == 'push'
@@ -73,7 +76,7 @@ jobs:
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
 
 
-        run: ./gradlew --no-daemon build publishAndReleaseToMavenCentral
+        run: ./gradlew --no-daemon --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' build publishAndReleaseToMavenCentral
 
       - name: Bundle GitHub Release assets
         if: github.event_name == 'push'
